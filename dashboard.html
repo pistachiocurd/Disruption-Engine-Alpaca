@@ -1,0 +1,597 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>Disruption Arbitrage Engine — Live Dashboard</title>
+<script src="/vendor/chart.umd.min.js"></script>
+<style>
+  :root {
+    --bg: #0e1116;
+    --panel: #161b22;
+    --panel-2: #1c232c;
+    --border: #2a313a;
+    --text: #d6dde6;
+    --muted: #7a8492;
+    --green: #3fb950;
+    --yellow: #d29922;
+    --red: #f85149;
+    --blue: #58a6ff;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 16px;
+    background: var(--bg); color: var(--text);
+    font-family: -apple-system, "Segoe UI", Roboto, sans-serif;
+    font-size: 13px;
+  }
+  h1 { font-size: 16px; margin: 0 0 12px; font-weight: 600; }
+  h2 { font-size: 12px; color: var(--muted); margin: 0 0 8px; text-transform: uppercase; letter-spacing: 0.05em; font-weight: 600; }
+  .grid { display: grid; gap: 12px; }
+  .row-status { grid-template-columns: repeat(7, 1fr); }
+  .row-charts { grid-template-columns: repeat(2, 1fr); }
+  .row-bottom { grid-template-columns: 1fr 1fr; }
+  .panel {
+    background: var(--panel); border: 1px solid var(--border);
+    border-radius: 6px; padding: 12px;
+  }
+  .stat .v { font-size: 20px; font-weight: 600; line-height: 1; margin-top: 4px; }
+  .stat .sub { color: var(--muted); font-size: 11px; margin-top: 4px; }
+  .ok { color: var(--green); }
+  .warn { color: var(--yellow); }
+  .bad { color: var(--red); }
+  .muted { color: var(--muted); }
+  .badge {
+    display: inline-block; padding: 2px 6px; border-radius: 3px;
+    font-size: 11px; background: var(--panel-2); border: 1px solid var(--border);
+  }
+  .badge.green { color: var(--green); border-color: var(--green); }
+  .badge.yellow { color: var(--yellow); border-color: var(--yellow); }
+  .badge.red { color: var(--red); border-color: var(--red); }
+  table { width: 100%; border-collapse: collapse; font-family: ui-monospace, "Consolas", monospace; font-size: 12px; }
+  th { color: var(--muted); text-align: left; font-weight: 500; padding: 4px 8px; border-bottom: 1px solid var(--border); }
+  td { padding: 4px 8px; border-bottom: 1px solid var(--panel-2); }
+  td.r { text-align: right; }
+  .chart-wrap { height: 140px; position: relative; }
+  .kv { display: grid; grid-template-columns: auto 1fr; gap: 4px 12px; font-family: ui-monospace, "Consolas", monospace; font-size: 12px; }
+  .kv .k { color: var(--muted); }
+  .kv .v { text-align: right; }
+  .conn { float: right; font-size: 11px; color: var(--muted); }
+  button.btn, button.btn-ghost {
+    background: var(--panel-2); color: var(--text); border: 1px solid var(--border);
+    border-radius: 4px; padding: 5px 10px; font-size: 11px; cursor: pointer;
+    font-family: inherit;
+  }
+  button.btn:hover, button.btn-ghost:hover { border-color: var(--blue); }
+  button.btn-ghost { color: var(--muted); }
+  input[type=range] { accent-color: var(--blue); }
+</style>
+</head>
+<body>
+
+<h1>
+  Disruption Arbitrage Engine
+  <span class="conn" id="conn">connecting…</span>
+</h1>
+
+<!-- ROW 1: status tiles -->
+<div class="grid row-status" style="margin-bottom: 12px">
+  <div class="panel stat"><h2>Symbol</h2><div class="v" id="symbol">—</div><div class="sub" id="exchange">—</div></div>
+  <div class="panel stat"><h2>Mode</h2><div class="v" id="mode">—</div><div class="sub" id="trading_enabled">—</div></div>
+  <div class="panel stat"><h2>Regime</h2><div class="v" id="regime">—</div><div class="sub">HMM dominant</div></div>
+  <div class="panel stat"><h2>OOD</h2><div class="v" id="ood">—</div><div class="sub" id="ood_thresh">thresh —</div></div>
+  <div class="panel stat"><h2>Drawdown</h2><div class="v" id="drawdown">—</div><div class="sub" id="drawdown_max">max —</div></div>
+  <div class="panel stat"><h2>Calibration</h2><div class="v" id="cal_status">—</div><div class="sub" id="drift_mape">MAPE —</div></div>
+  <div class="panel stat"><h2>Theoretical P&amp;L</h2><div class="v" id="pnl_total">—</div><div class="sub" id="pnl_sub">—</div></div>
+</div>
+
+<!-- ROW 2: sparklines -->
+<div class="grid row-charts" style="margin-bottom: 12px">
+  <div class="panel"><h2>VPIN (toxicity)</h2><div class="chart-wrap"><canvas id="vpinChart"></canvas></div></div>
+  <div class="panel"><h2>Mahalanobis distance (OOD)</h2><div class="chart-wrap"><canvas id="mahalChart"></canvas></div></div>
+  <div class="panel"><h2>C/E ratio (cancellation pressure)</h2><div class="chart-wrap"><canvas id="ceChart"></canvas></div></div>
+  <div class="panel"><h2>Viscosity (Kalman spread)</h2><div class="chart-wrap"><canvas id="viscChart"></canvas></div></div>
+</div>
+
+<!-- ROW 3: state + decision log -->
+<div class="grid row-bottom" style="margin-bottom: 12px">
+  <div class="panel">
+    <h2>Physics State</h2>
+    <div class="kv" id="state_kv"></div>
+  </div>
+  <div class="panel">
+    <h2>Recent Alpha Decisions</h2>
+    <table id="decisions">
+      <thead><tr><th>time</th><th>outcome</th><th class="r">detail</th></tr></thead>
+      <tbody></tbody>
+    </table>
+  </div>
+</div>
+
+<!-- ROW 4: shadow trainer + episodes -->
+<div class="grid row-bottom" style="margin-bottom: 12px">
+  <div class="panel">
+    <h2>Shadow Trainer (Layer 4)</h2>
+    <div class="kv" id="shadow_kv"></div>
+  </div>
+  <div class="panel">
+    <h2>Recent Episodes (Layer 3)</h2>
+    <table id="episodes">
+      <thead><tr><th>time</th><th>dir</th><th class="r">size</th><th class="r">mean IS</th><th class="r">forced</th></tr></thead>
+      <tbody><tr><td colspan="5" style="color: var(--muted)">no episodes yet</td></tr></tbody>
+    </table>
+  </div>
+</div>
+
+<!-- ROW 4.5: TCN operating point — PR curve + manual override -->
+<div class="panel" style="margin-bottom: 12px">
+  <h2>TCN Operating Point <span style="float:right; color: var(--muted); font-weight: 400" id="threshold_source"></span></h2>
+  <div style="display: grid; grid-template-columns: 1fr 320px; gap: 16px; align-items: stretch">
+    <div class="chart-wrap" style="height: 200px"><canvas id="prCurveChart"></canvas></div>
+    <div>
+      <div class="kv" id="threshKv" style="margin-bottom: 8px"></div>
+      <label style="display: block; margin: 8px 0 4px; color: var(--muted); font-size: 11px">
+        TURBULENCE THRESHOLD
+      </label>
+      <div style="display: flex; align-items: center; gap: 8px; margin-bottom: 6px">
+        <input type="range" min="0.01" max="0.99" step="0.001" value="0.5" id="threshSlider" style="flex: 1">
+        <span id="threshVal" style="font-family: ui-monospace, Consolas, monospace; font-size: 13px; min-width: 60px; text-align: right">0.500</span>
+      </div>
+      <div id="threshPreview" style="font-family: ui-monospace, Consolas, monospace; font-size: 11px; color: var(--muted); margin-bottom: 8px; min-height: 14px"></div>
+      <div style="display: flex; gap: 6px">
+        <button id="applyThresh" class="btn">Apply (live)</button>
+        <button id="saveThresh"  class="btn">Apply &amp; save</button>
+        <button id="resetThresh" class="btn-ghost">Reset</button>
+      </div>
+      <div id="threshAck" style="font-size: 11px; color: var(--muted); margin-top: 6px; min-height: 14px"></div>
+    </div>
+  </div>
+</div>
+
+<!-- ROW 5: per-fill order log -->
+<div class="panel">
+  <h2>Recent Orders (per-step fills) <span style="float:right; color: var(--muted); font-weight: 400" id="orders_summary"></span></h2>
+  <table id="orders">
+    <thead>
+      <tr>
+        <th>time</th>
+        <th>ep</th>
+        <th>side</th>
+        <th class="r">action</th>
+        <th>type</th>
+        <th class="r">filled</th>
+        <th class="r">fill px</th>
+        <th class="r">vs decision</th>
+        <th class="r">fee paid</th>
+        <th class="r">step IS</th>
+        <th class="r">remaining</th>
+      </tr>
+    </thead>
+    <tbody><tr><td colspan="11" style="color: var(--muted)">no orders yet</td></tr></tbody>
+  </table>
+</div>
+
+<script>
+const POLL_MS = 500;
+const HISTORY_LEN = 240; // ~2 minutes at 500ms
+
+function newChart(canvasId, color, yMin, yMax) {
+  const ctx = document.getElementById(canvasId);
+  return new Chart(ctx, {
+    type: "line",
+    data: { labels: [], datasets: [{
+      data: [], borderColor: color, borderWidth: 1.4,
+      pointRadius: 0, tension: 0.25, fill: false,
+    }]},
+    options: {
+      responsive: true, maintainAspectRatio: false, animation: false,
+      plugins: { legend: { display: false }, tooltip: { enabled: false } },
+      scales: {
+        x: { display: false },
+        y: {
+          min: yMin, max: yMax,
+          ticks: { color: "#7a8492", font: { size: 10 } },
+          grid: { color: "#2a313a" },
+        },
+      },
+    },
+  });
+}
+
+const charts = {
+  vpin: newChart("vpinChart", "#58a6ff", 0, 1),
+  mahal: newChart("mahalChart", "#f85149", 0, undefined),
+  ce: newChart("ceChart", "#d29922", 0, 50),
+  visc: newChart("viscChart", "#3fb950", 0, undefined),
+};
+
+// PR curve chart — separate setup (not a sparkline; precision/recall pair).
+let prCurveChart = null;
+function ensurePrCurveChart() {
+  if (prCurveChart) return prCurveChart;
+  const ctx = document.getElementById("prCurveChart");
+  prCurveChart = new Chart(ctx, {
+    type: "line",
+    data: { datasets: [
+      {
+        label: "precision",
+        data: [],
+        parsing: false,
+        borderColor: "#3fb950",
+        backgroundColor: "transparent",
+        borderWidth: 1.4,
+        pointRadius: 0,
+      },
+      {
+        label: "recall",
+        data: [],
+        parsing: false,
+        borderColor: "#58a6ff",
+        backgroundColor: "transparent",
+        borderWidth: 1.4,
+        pointRadius: 0,
+      },
+      {
+        label: "current",
+        data: [],
+        parsing: false,
+        borderColor: "#d29922",
+        backgroundColor: "rgba(210,153,34,0.18)",
+        borderWidth: 1,
+        pointRadius: 0,
+        showLine: true,
+        fill: false,
+      },
+    ]},
+    options: {
+      responsive: true, maintainAspectRatio: false, animation: false,
+      plugins: { legend: { display: true, labels: { color: "#7a8492", font: { size: 10 } } } },
+      scales: {
+        x: {
+          type: "linear", min: 0, max: 1,
+          title: { display: true, text: "threshold", color: "#7a8492", font: { size: 10 } },
+          ticks: { color: "#7a8492", font: { size: 10 } },
+          grid: { color: "#2a313a" },
+        },
+        y: {
+          min: 0, max: 1,
+          ticks: { color: "#7a8492", font: { size: 10 } },
+          grid: { color: "#2a313a" },
+        },
+      },
+    },
+  });
+  return prCurveChart;
+}
+
+function interpolateCurve(curve, t) {
+  if (!curve || curve.length === 0) return null;
+  // curve is sorted by threshold ascending
+  if (t <= curve[0].threshold) return curve[0];
+  if (t >= curve[curve.length - 1].threshold) return curve[curve.length - 1];
+  for (let i = 1; i < curve.length; i++) {
+    if (t <= curve[i].threshold) {
+      const a = curve[i - 1], b = curve[i];
+      const w = (t - a.threshold) / (b.threshold - a.threshold || 1);
+      return {
+        threshold: t,
+        precision: a.precision + w * (b.precision - a.precision),
+        recall:    a.recall    + w * (b.recall    - a.recall),
+        f1:        a.f1        + w * (b.f1        - a.f1),
+      };
+    }
+  }
+  return curve[curve.length - 1];
+}
+
+// Slider state — user input mode while dragging suspends the auto-sync from /state.
+let sliderEdited = false;
+let lastServerThreshold = null;
+const slider = document.getElementById("threshSlider");
+const threshVal = document.getElementById("threshVal");
+const threshPreview = document.getElementById("threshPreview");
+const threshKv = document.getElementById("threshKv");
+const threshSourceLabel = document.getElementById("threshold_source");
+const threshAck = document.getElementById("threshAck");
+
+slider.addEventListener("input", () => {
+  sliderEdited = true;
+  threshVal.textContent = parseFloat(slider.value).toFixed(3);
+  updateLivePreview();
+});
+
+document.getElementById("applyThresh").onclick = () => postThreshold(false);
+document.getElementById("saveThresh").onclick = () => postThreshold(true);
+document.getElementById("resetThresh").onclick = () => {
+  if (lastServerThreshold !== null) {
+    slider.value = lastServerThreshold;
+    threshVal.textContent = lastServerThreshold.toFixed(3);
+    sliderEdited = false;
+    threshAck.textContent = "Reset to server value.";
+    updateLivePreview();
+  }
+};
+
+let lastCurve = null;
+function updateLivePreview() {
+  if (!lastCurve) { threshPreview.textContent = ""; return; }
+  const t = parseFloat(slider.value);
+  const point = interpolateCurve(lastCurve, t);
+  if (!point) { threshPreview.textContent = ""; return; }
+  threshPreview.textContent =
+    `≈ precision ${point.precision.toFixed(3)} · recall ${point.recall.toFixed(3)} · F1 ${point.f1.toFixed(3)}`;
+}
+
+async function postThreshold(persist) {
+  const t = parseFloat(slider.value);
+  threshAck.textContent = "applying…";
+  try {
+    const r = await fetch("/api/threshold", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({ threshold: t, persist: persist }),
+    });
+    const j = await r.json();
+    if (!r.ok || j.error) {
+      threshAck.textContent = "error: " + (j.error || r.status);
+      threshAck.style.color = "var(--red)";
+      return;
+    }
+    threshAck.textContent = persist
+      ? `applied + saved to ${j.persisted_to || "disk"}`
+      : "applied (live, not persisted)";
+    threshAck.style.color = "var(--green)";
+    sliderEdited = false;  // resume auto-sync from /state
+  } catch (err) {
+    threshAck.textContent = "error: " + err;
+    threshAck.style.color = "var(--red)";
+  }
+}
+
+function pushChart(chart, value) {
+  const ds = chart.data.datasets[0].data;
+  const lbls = chart.data.labels;
+  lbls.push("");
+  ds.push(value);
+  if (ds.length > HISTORY_LEN) {
+    ds.shift(); lbls.shift();
+  }
+  chart.update("none");
+}
+
+function fmt(n, d=4) {
+  if (n === null || n === undefined || Number.isNaN(n)) return "—";
+  if (typeof n !== "number") return String(n);
+  return n.toFixed(d);
+}
+
+function badge(text, klass) {
+  return `<span class="badge ${klass}">${text}</span>`;
+}
+
+async function tick() {
+  try {
+    const r = await fetch("/state");
+    if (!r.ok) throw new Error(r.status);
+    const s = await r.json();
+    document.getElementById("conn").textContent = "● live";
+    document.getElementById("conn").style.color = "var(--green)";
+
+    // Status row
+    document.getElementById("symbol").textContent = s.engine.symbol;
+    document.getElementById("exchange").textContent = s.engine.exchange_id;
+    const mode = s.engine.shadow_mode ? "SHADOW" : (s.engine.exchange_live ? "LIVE" : "TESTNET");
+    const modeEl = document.getElementById("mode");
+    modeEl.textContent = mode;
+    modeEl.className = "v " + (s.engine.shadow_mode ? "ok" : "warn");
+    document.getElementById("trading_enabled").textContent =
+      "trading " + (s.engine.trading_enabled ? "ON" : "HALTED");
+
+    const regimeLabels = ["LAMINAR", "TRANSITION", "TURBULENT"];
+    const regimeColors = ["ok", "warn", "bad"];
+    const regEl = document.getElementById("regime");
+    regEl.textContent = regimeLabels[s.physics_state.regime] || "—";
+    regEl.className = "v " + (regimeColors[s.physics_state.regime] || "");
+
+    const oodEl = document.getElementById("ood");
+    oodEl.textContent = fmt(s.physics_state.mahal_dist, 2);
+    oodEl.className = "v " + (s.physics_state.ood_flag ? "bad" : "ok");
+    document.getElementById("ood_thresh").textContent =
+      "thresh " + fmt(s.physics_state.ood_threshold, 1) +
+      (s.physics_state.ood_flag ? " — OOD" : " — in-dist");
+
+    const dd = s.engine.drawdown_pct;
+    const ddEl = document.getElementById("drawdown");
+    ddEl.textContent = (dd * 100).toFixed(2) + "%";
+    ddEl.className = "v " + (dd > s.engine.max_drawdown_pct ? "bad" : (dd > 0.5 * s.engine.max_drawdown_pct ? "warn" : "ok"));
+    document.getElementById("drawdown_max").textContent =
+      "max " + (s.engine.max_drawdown_pct * 100).toFixed(2) + "%";
+
+    const calEl = document.getElementById("cal_status");
+    calEl.textContent = s.engine.calibration_stale ? "STALE" : "OK";
+    calEl.className = "v " + (s.engine.calibration_stale ? "bad" : "ok");
+    document.getElementById("drift_mape").textContent = "MAPE " + fmt(s.engine.drift_mape, 3);
+
+    // TCN PR curve + threshold UI
+    {
+      const a = s.alpha || {};
+      const payload = a.tcn_threshold_payload;
+      const liveThresh = a.turbulence_threshold;
+      lastServerThreshold = liveThresh;
+      threshSourceLabel.textContent =
+        `source: ${a.turbulence_threshold_source || "—"}  ·  current: ${fmt(liveThresh, 3)}`;
+
+      // Sync slider to server unless the user is actively editing.
+      if (!sliderEdited && liveThresh !== undefined && liveThresh !== null) {
+        slider.value = liveThresh;
+        threshVal.textContent = liveThresh.toFixed(3);
+      }
+
+      // Curve from sidecar payload (if a TCN was trained for this symbol).
+      const chart = ensurePrCurveChart();
+      if (payload && Array.isArray(payload.pr_curve) && payload.pr_curve.length > 0) {
+        lastCurve = payload.pr_curve;
+        const precData = lastCurve.map(p => ({ x: p.threshold, y: p.precision }));
+        const recData  = lastCurve.map(p => ({ x: p.threshold, y: p.recall }));
+        chart.data.datasets[0].data = precData;
+        chart.data.datasets[1].data = recData;
+        // Vertical "current threshold" marker — two points at (t, 0) and (t, 1).
+        const t = parseFloat(slider.value);
+        chart.data.datasets[2].data = [{ x: t, y: 0 }, { x: t, y: 1 }];
+        chart.update("none");
+
+        const trained = interpolateCurve(lastCurve, payload.threshold);
+        threshKv.innerHTML = `
+          <div class="k">trained on</div><div class="v">${payload.trained_on_rows || 0} rows · ${payload.trained_on_shocks || 0} shocks</div>
+          <div class="k">target precision</div><div class="v">${fmt(payload.target_precision, 2)}</div>
+          <div class="k">trained threshold</div><div class="v">${fmt(payload.threshold, 4)}</div>
+          <div class="k">prec @ trained</div><div class="v ${payload.satisfied_target ? 'ok' : 'bad'}">${fmt(payload.achieved_precision, 3)}</div>
+          <div class="k">recall @ trained</div><div class="v">${fmt(payload.achieved_recall, 3)}</div>
+        `;
+        updateLivePreview();
+      } else {
+        lastCurve = null;
+        threshKv.innerHTML = `<div class="k" style="grid-column: 1 / span 2; color: var(--muted)">No TCN trained for ${s.engine.symbol}. Run train_tcn.py to populate this panel.</div>`;
+        chart.data.datasets[0].data = [];
+        chart.data.datasets[1].data = [];
+        const t = parseFloat(slider.value);
+        chart.data.datasets[2].data = [{ x: t, y: 0 }, { x: t, y: 1 }];
+        chart.update("none");
+        threshPreview.textContent = "";
+      }
+    }
+
+    // Theoretical P&L
+    const pnl = s.engine.pnl_theoretical || 0;
+    const pnlEl = document.getElementById("pnl_total");
+    pnlEl.textContent = (pnl >= 0 ? "+$" : "-$") + fmt(Math.abs(pnl), 2);
+    pnlEl.className = "v " + (pnl > 0 ? "ok" : (pnl < 0 ? "bad" : ""));
+    const pos = s.engine.pnl_position || 0;
+    const fees = s.engine.pnl_total_fees || 0;
+    document.getElementById("pnl_sub").textContent =
+      `pos ${fmt(pos, 4)} BTC · fees $${fmt(fees, 2)}`;
+
+    // Charts
+    pushChart(charts.vpin, s.physics_state.vpin);
+    pushChart(charts.mahal, s.physics_state.mahal_dist);
+    pushChart(charts.ce, s.physics_state.ce_ratio);
+    pushChart(charts.visc, s.physics_state.viscosity);
+
+    // Physics state KV
+    const ps = s.physics_state;
+    document.getElementById("state_kv").innerHTML = `
+      <div class="k">best bid / ask</div><div class="v">${fmt(ps.best_bid, 2)} / ${fmt(ps.best_ask, 2)}</div>
+      <div class="k">VPIN</div><div class="v">${fmt(ps.vpin, 4)}</div>
+      <div class="k">α calibrated</div><div class="v">${fmt(ps.alpha_calibrated, 5)}</div>
+      <div class="k">viscosity</div><div class="v">${fmt(ps.viscosity, 4)}</div>
+      <div class="k">OBI (top)</div><div class="v">${fmt(ps.obi, 4)}</div>
+      <div class="k">spread velocity</div><div class="v">${fmt(ps.spread_velocity, 4)}</div>
+      <div class="k">liquidation rate</div><div class="v">${fmt(ps.liquidation_rate, 4)}</div>
+      <div class="k">last turbulence (TCN)</div><div class="v">${fmt(s.alpha.last_turbulence, 4)}</div>
+      <div class="k">TCN buffer</div><div class="v">${s.alpha.tcn_buffer_size} / ${s.alpha.tcn_buffer_target}</div>
+    `;
+
+    // Decisions
+    const dtbody = document.querySelector("#decisions tbody");
+    const decisions = s.alpha.decisions.slice().reverse().slice(0, 25);
+    if (decisions.length === 0) {
+      dtbody.innerHTML = `<tr><td colspan="3" style="color: var(--muted)">no evaluations yet</td></tr>`;
+    } else {
+      dtbody.innerHTML = decisions.map(d => {
+        const t = new Date(d.ts).toLocaleTimeString();
+        let cls = "yellow";
+        if (d.outcome === "mandate") cls = "green";
+        else if (d.outcome.startsWith("suppressed")) cls = "red";
+        else if (d.outcome === "warming_up" || d.outcome === "no_orderbook") cls = "yellow";
+        else if (d.outcome === "below_turbulence") cls = "yellow";
+        const detailParts = [];
+        if (d.mahal_dist !== undefined) detailParts.push(`mahal=${fmt(d.mahal_dist, 2)}`);
+        if (d.turbulence !== undefined) detailParts.push(`turb=${fmt(d.turbulence, 3)}`);
+        if (d.buffer_size !== undefined) detailParts.push(`buf=${d.buffer_size}`);
+        if (d.direction !== undefined) detailParts.push(`dir=${d.direction > 0 ? "+" : ""}${d.direction}`);
+        if (d.target_size !== undefined) detailParts.push(`size=${fmt(d.target_size, 4)}`);
+        if (d.p_eq !== undefined) detailParts.push(`P_eq=${fmt(d.p_eq, 2)}`);
+        return `<tr>
+          <td>${t}</td>
+          <td>${badge(d.outcome, cls)}</td>
+          <td class="r">${detailParts.join(" · ")}</td>
+        </tr>`;
+      }).join("");
+    }
+
+    // Shadow trainer
+    document.getElementById("shadow_kv").innerHTML = `
+      <div class="k">device</div><div class="v">${s.shadow.device}</div>
+      <div class="k">replay buffer</div><div class="v">${s.shadow.replay_size}</div>
+      <div class="k">steps since last push</div><div class="v">${s.shadow.steps_since_last_push} / ${s.shadow.min_shadow_steps}</div>
+      <div class="k">KL threshold</div><div class="v">${fmt(s.shadow.kl_threshold, 3)}</div>
+    `;
+
+    // Episodes
+    const etbody = document.querySelector("#episodes tbody");
+    const eps = s.execution.recent_episodes.slice().reverse();
+    if (eps.length === 0) {
+      etbody.innerHTML = `<tr><td colspan="5" style="color: var(--muted)">no episodes yet</td></tr>`;
+    } else {
+      etbody.innerHTML = eps.map(e => {
+        const t = new Date(e.ts).toLocaleTimeString();
+        const dir = e.direction > 0 ? "+1" : "-1";
+        const isClass = e.mean_is > 0 ? "bad" : "ok";
+        return `<tr>
+          <td>${t}</td>
+          <td class="${e.direction > 0 ? "ok" : "bad"}">${dir}</td>
+          <td class="r">${fmt(e.target_size, 4)}</td>
+          <td class="r ${isClass}">${fmt(e.mean_is * 10000, 1)} bps</td>
+          <td class="r">${e.forced_terminal ? "yes" : "—"}</td>
+        </tr>`;
+      }).join("");
+    }
+
+    // Orders (per-step fills)
+    const otbody = document.querySelector("#orders tbody");
+    const orders = (s.execution.recent_orders || []).slice().reverse().slice(0, 60);
+    document.getElementById("orders_summary").textContent =
+      `${s.execution.total_orders || 0} total / ${s.execution.total_episodes_run || 0} episodes`;
+    if (orders.length === 0) {
+      otbody.innerHTML = `<tr><td colspan="11" style="color: var(--muted)">no orders yet</td></tr>`;
+    } else {
+      otbody.innerHTML = orders.map(o => {
+        const t = new Date(o.ts).toLocaleTimeString();
+        const sideCls = o.side === "buy" ? "ok" : "bad";
+        let typeBadge;
+        if (o.order_type === "market") typeBadge = badge("market", "yellow");
+        else if (o.order_type === "limit") typeBadge = badge("limit", "green");
+        else typeBadge = badge("forced", "red");
+        const filled = o.filled_qty || 0;
+        const filledCls = filled > 0 ? "ok" : "muted";
+        const isCls = o.is_bps > 0 ? "bad" : (o.is_bps < 0 ? "ok" : "");
+        const slipBps = o.fill_price > 0 && o.p_decision > 0
+          ? ((o.fill_price - o.p_decision) / o.p_decision * 10000) * (o.direction > 0 ? 1 : -1)
+          : 0;
+        const slipCls = slipBps > 0 ? "bad" : (slipBps < 0 ? "ok" : "");
+        return `<tr>
+          <td>${t}</td>
+          <td>#${o.episode_id}</td>
+          <td class="${sideCls}">${o.side}</td>
+          <td class="r">${fmt(o.action, 3)}</td>
+          <td>${typeBadge}</td>
+          <td class="r ${filledCls}">${fmt(filled, 4)}</td>
+          <td class="r">${o.fill_price > 0 ? fmt(o.fill_price, 2) : "—"}</td>
+          <td class="r ${slipCls}">${o.fill_price > 0 ? fmt(slipBps, 1) + " bps" : "—"}</td>
+          <td class="r">$${fmt(o.fee_paid, 4)}</td>
+          <td class="r ${isCls}">${filled > 0 ? fmt(o.is_bps, 1) + " bps" : "—"}</td>
+          <td class="r">${fmt(o.remaining_after, 4)}</td>
+        </tr>`;
+      }).join("");
+    }
+  } catch (err) {
+    document.getElementById("conn").textContent = "● disconnected";
+    document.getElementById("conn").style.color = "var(--red)";
+  }
+}
+
+setInterval(tick, POLL_MS);
+tick();
+</script>
+
+</body>
+</html>

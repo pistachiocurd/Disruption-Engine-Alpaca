@@ -1,0 +1,26 @@
+# Core
+numpy>=1.26,<3.0
+scipy>=1.11
+
+# Deep learning. For the RTX 5070 Ti, install the CUDA 12.x build separately
+# (see README); the unpinned requirement here resolves to the CPU build by default.
+torch>=2.2
+
+# Reinforcement learning environment
+gymnasium>=0.29
+
+# Exchange / WebSockets
+# US equities (Alpaca) — primary path for the equities pivot. Provides the
+# StockDataStream live feed, StockHistoricalDataClient for the historical
+# harvester, and TradingClient for /v2/calendar plus order routing.
+alpaca-py>=0.13
+# Crypto path — kept optional for back-compat / regression on the original
+# Coinbase Advanced + Binance configurations.
+ccxt>=4.3                 # ccxt.pro is bundled in recent versions; coinbaseadvanced supported
+websockets>=12.0          # raw connection used by the (Binance-only) forceOrder liquidation stream
+
+# Hyperparameter optimization
+optuna>=3.5
+
+# Testing
+pytest>=8.0
