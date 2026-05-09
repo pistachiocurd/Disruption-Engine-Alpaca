@@ -1,10 +1,15 @@
 # Core
 numpy>=1.26,<3.0
 scipy>=1.11
+pandas>=2.2.0
+polars>=1.4.0
+pyarrow>=15.0.0
 
-# Deep learning. For the RTX 5070 Ti, install the CUDA 12.x build separately
-# (see README); the unpinned requirement here resolves to the CPU build by default.
+# Deep learning. The unpinned requirement here resolves to the CPU build by
+# default; install the CUDA 12.x build separately if you have an NVIDIA GPU
+# (see README — the streaming trainer benefits substantially from GPU bf16).
 torch>=2.2
+scikit-learn>=1.4.0
 
 # Reinforcement learning environment
 gymnasium>=0.29
@@ -24,3 +29,12 @@ optuna>=3.5
 
 # Testing
 pytest>=8.0
+
+# Dashboard server (dashboard.py serves the live engine UI over HTTP).
+aiohttp>=3.9
+
+# Monitoring & Visualization
+tqdm>=4.66.0
+matplotlib>=3.8.0
+seaborn>=0.13.0
+tensorboard>=2.15.0

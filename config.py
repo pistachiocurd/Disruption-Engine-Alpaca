@@ -44,7 +44,7 @@ IS_EQUITY = "/" not in SYMBOL
 
 # Per-symbol artifact paths. Engine + tools read from these by default so that
 # data and weights for one coin never bleed into another's runs.
-FEATURE_DUMP_PATH = f"./calibration/feature_history_{SYMBOL_SLUG}.csv"
+FEATURE_DUMP_PATH = f"./calibration/feature_history_{SYMBOL_SLUG}_balanced.csv"
 OOD_CALIBRATION_PATH = f"./calibration/latest_{SYMBOL_SLUG}.json"
 TCN_WEIGHTS_PATH = f"./calibration/tcn_weights_{SYMBOL_SLUG}.pt"
 TCN_THRESHOLD_PATH = f"./calibration/tcn_threshold_{SYMBOL_SLUG}.json"
@@ -132,13 +132,21 @@ CALIBRATION_REGISTRY = {
 ALPHA_CALIBRATION_C = CALIBRATION_REGISTRY.get(SYMBOL, 0.25)
 
 # Shock event identification
-SHOCK_PRICE_MOVE_PCT = 0.003           # 0.3%
+SHOCK_PRICE_MOVE_PCT = 0.0025           # DEFAULT: 0.3%
 MIN_SHOCK_SPACING_SECONDS = 60
-MAX_DIFFUSION_TICKS = 200
-EQUILIBRIUM_BAND_PCT = 0.001           # 0.1%
-EQUILIBRIUM_STABILITY_TICKS = 10
+MAX_DIFFUSION_TICKS = 6000              #DEFAULT 20
+
+# TCN leading-classifier horizon (used by train_stream.py). For each shock
+# event at tick t, the H ticks in [t-H, t) are labeled positive — i.e. the
+# model is trained to answer "will a shock start within the next H ticks?".
+# 30 = 30 seconds at Alpaca's 1Hz IEX feed (actionable execution window;
+# stays well within session boundaries). Crypto pipelines using train_tcn.py
+# still consume MAX_DIFFUSION_TICKS above for back-compat.
+TCN_LABEL_HORIZON_TICKS = 30
+EQUILIBRIUM_BAND_PCT = 0.002           # DEFAULT 0.1% (0.001)
+EQUILIBRIUM_STABILITY_TICKS = 300        #DEFAULT: 10
 MIN_CALIBRATION_EVENTS = 30
-TURBULENCE_THRESHOLD = 0.9
+TURBULENCE_THRESHOLD = 0.5              #DEFAULT: 0.9
 
 # Drift detection
 DRIFT_THRESHOLD = 0.35                 # MAPE threshold

@@ -1,0 +1,13 @@
+{
+  "threshold": 0.7,
+  "precision": 0.401414309484193,
+  "recall": 0.45347744360902253,
+  "f1": 0.4258605472197705,
+  "criterion": "fbeta",
+  "beta": 2.0,
+  "sweep_source": "val",
+  "sweep_csv_path": "./calibration/feature_history_PLTR.csv",
+  "sweep_n_predictions": 9365063,
+  "sweep_n_positives": 4256,
+  "fallback": false
+}

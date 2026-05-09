@@ -102,13 +102,13 @@ def build_labels(data: dict) -> tuple[np.ndarray, list]:
     vpin_series = data["vpin"].tolist()
 
     events = identify_shock_events(ob_snapshots, vpin_series)
-    print(f"identify_shock_events found {len(events)} shock events.")
-    if len(events) < 5:
-        print(
-            "WARNING: very few shocks. Training will be near-trivial. "
-            "Consider increasing --shocks or collecting more real data.",
-            file=sys.stderr,
-        )
+    #print(f"identify_shock_events found {len(events)} shock events.")
+    #if len(events) < 5:
+        #print(
+            #"WARNING: very few shocks. Training will be near-trivial. "
+            #"Consider increasing --shocks or collecting more real data.",
+            #file=sys.stderr,
+        #)
 
     labels = np.zeros(n, dtype=np.float32)
     horizon = config.MAX_DIFFUSION_TICKS

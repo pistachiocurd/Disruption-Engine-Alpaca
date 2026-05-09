@@ -41,9 +41,11 @@ $env:SYMBOL = "NVDA"
 python fetch_history_alpaca.py --symbol NVDA --days 14
 
 # 7. Verify enough shock events were captured, fit OOD, train the TCN.
+#    Use train_tcn.py for harvests that fit in RAM, train_stream.py for
+#    multi-GB streams (also auto-tunes the engine threshold from a sweep).
 python check_shocks.py
 python fit_ood_from_csv.py
-python train_tcn.py
+python train_tcn.py        # or: python train_stream.py
 
 # 8. Live shadow-mode smoke test (during market hours).
 python engine.py
@@ -121,14 +123,74 @@ python check_shocks.py
 # 3. Fit OOD distribution; writes calibration/latest_NVDA.json.
 python fit_ood_from_csv.py
 
-# 4. Train the TCN; writes calibration/tcn_weights_NVDA.pt and
-#    tcn_threshold_NVDA.json.
+# 4a. Train the TCN — in-memory path, fine for harvests up to ~1 GB.
+#     Writes calibration/tcn_weights_NVDA.pt + tcn_threshold_NVDA.json.
 python train_tcn.py
+
+# 4b. ...or use the streaming trainer for multi-GB harvests. Same outputs;
+#     also runs a post-train threshold sweep and writes the full
+#     precision/recall/F1 curve to tcn_threshold_sweep_NVDA.csv.
+python train_stream.py
 ```
+
+`train_stream.py` differs from `train_tcn.py` in three ways: (1) it
+streams the CSV in polars batches via an `IterableDataset` instead of
+loading it into RAM, (2) it builds positive labels directly from the
+`regime` column when present (denser and more reliable than re-running
+`identify_shock_events` on a curated/discontinuous file), and (3) it
+auto-tunes the engine's operating threshold from a precision/recall
+sweep instead of saving the placeholder `config.TURBULENCE_THRESHOLD`.
 
 The crypto pipeline (online L2 capture, `identify_shock_events()`, EWLS
 fit for `ALPHA_CALIBRATION_C`) is unchanged and documented in
 `IMPLEMENTATION.md` §4.
+
+## Threshold tuning
+
+The engine reads `tcn_threshold_<SYMBOL>.json["threshold"]` at startup as
+the boundary between "fire a mandate" and "stay quiet". `train_stream.py`
+picks that value from a sweep over the trained model's prediction
+distribution — by default with F-β where β=2 (recall-biased, on the
+premise that a missed shock costs more than a wasted mandate).
+
+```powershell
+# Re-pick the threshold from existing weights — no retraining (~30s).
+python train_stream.py --tune-only
+
+# Switch criteria without retraining:
+python train_stream.py --tune-only --threshold-criterion f1
+python train_stream.py --tune-only --threshold-criterion min-precision --min-precision 0.75
+python train_stream.py --tune-only --threshold-criterion min-recall --min-recall 0.70
+python train_stream.py --tune-only --threshold-criterion fbeta --beta 3.0
+```
+
+Available criteria: `f1`, `fbeta` (default, with `--beta 2.0`),
+`min-precision` (highest recall meeting the precision floor), and
+`min-recall` (highest precision meeting the recall floor). The chosen
+threshold + the underlying prec/rec/F1 are persisted as metadata in the
+JSON; the full sweep table is dumped to
+`calibration/tcn_threshold_sweep_<SYMBOL>.csv` for plotting.
+
+### Held-out and cross-symbol evaluation
+
+Pointing `--val-csv` at a different CSV runs the threshold sweep on it
+instead of on the training data. Saves go to
+`tcn_threshold_eval_<val_stem>.json` and
+`tcn_threshold_sweep_eval_<val_stem>.csv` so the production threshold for
+the current `SYMBOL` is never clobbered by a diagnostic run.
+
+```powershell
+# Temporal hold-out (different week, same symbol).
+python train_stream.py --tune-only --val-csv calibration/feature_history_NVDA_holdout.csv
+
+# Cross-symbol generalization (NVDA-trained → PLTR raw harvest).
+python train_stream.py --tune-only --val-csv calibration/feature_history_PLTR.csv
+```
+
+Cross-symbol F1 will be materially lower than train-set F1 — that's
+expected. Per-symbol calibration is the operational answer; the
+cross-symbol number quantifies how much of the shock signature is
+microstructure-universal vs ticker-specific.
 
 ## File layout
 
@@ -144,7 +206,8 @@ disruption_arbitrage_engine/
 ├── matching_engine.py        # LocalMatchingEngine — paper fills
 ├── calibration.py            # shock identification, EWLS, drift monitor, OOD fit
 ├── fetch_history_alpaca.py   # historical harvester for the equities path
-├── train_tcn.py              # supervised TCN training
+├── train_tcn.py              # supervised TCN training (in-memory)
+├── train_stream.py           # streaming TCN trainer + threshold sweep
 ├── check_shocks.py           # validates feature_history shock density
 ├── fit_ood_from_csv.py       # offline OOD μ, Σ fit from feature_history
 ├── hpo.py                    # Optuna HPO over reward weights
