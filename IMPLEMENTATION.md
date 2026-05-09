@@ -137,8 +137,14 @@ operation.
 | Stability gate (KL + regime + steps)        | `layer4_shadow.StabilityGate`                       |
 | Polyak averaging                            | `layer4_shadow.polyak_update()`                     |
 | HPO over (η, γ_inv, terminal_mult)          | `hpo.py`                                            |
-| Kill switches (drawdown, exception, signal) | `engine.py`                                         |
-| Equity market-hours gate + state reset      | `engine.SessionManager` + `SensorArray.reset_session()` |
+| Kill switches (drawdown, exception, signal) | `engine.py` (see §3.4 for gate inventory)           |
+| Aggregate position limit                    | `engine.Engine._would_exceed_position_limit()`      |
+| IS-based drawdown gate                      | `engine.Engine._is_drawdown_breached()`             |
+| MTM-based drawdown gate                     | `engine.Engine._mtm_drawdown_breached()`            |
+| Hybrid drawdown composer                    | `engine.Engine._max_drawdown_breached()`            |
+| Session risk-state reset                    | `engine.Engine._reset_session_risk_state()`         |
+| Equity market-hours gate + state reset      | `engine.SessionManager` + `SensorArray.reset_session()` + `Engine._reset_session_risk_state()` |
+| Replay-mode driver                          | `test_replay.ReplaySensorArray` (gated by `config.REPLAY_CSV`) |
 
 ---
 
@@ -180,22 +186,52 @@ volume cheaply.
   the engine (or trigger a recalibration that writes to disk and signals the
   engine to reload).
 
-### 3.4 Mandate generation has four independent gates
+### 3.4 Mandate generation has independent gates at every layer
 
-In `AlphaEngine.evaluate()` and `HeatEquationSolver.solve()`:
+Layer-2 gates (`AlphaEngine.evaluate()` and `HeatEquationSolver.solve()`):
 
-1. `physics_state.ood_flag` (Mahalanobis > threshold) → suppressed.
+1. `physics_state.ood_flag` (Mahalanobis > `OOD_THRESHOLD = 4.5` against the
+   calibrated μ/Σ) → suppressed.
 2. `turbulence_index < TURBULENCE_THRESHOLD` → no solver call.
 3. P_eq sensitivity range > confidence band → suppressed.
-4. `target_size < MIN_ORDER_SIZE` → suppressed.
+4. `target_size < MIN_ORDER_SIZE` (per-mandate) → suppressed.
 
-Plus the engine-level gates:
+Engine-level gates (in `_strategy_loop` between mandate generation and
+execution):
 
-5. `CALIBRATION_STALE` (drift) → strategy loop skips this iteration.
-6. Drawdown > 2% → kill switch trips, all orders cancelled.
-7. Unhandled exception → kill switch trips, all orders cancelled.
+5. `CALIBRATION_STALE` (drift monitor MAPE > 0.35) → strategy loop skips.
+6. **Aggregate position limit** (`_would_exceed_position_limit`): if the
+   mandate would push `abs(_position)` further past `MAX_POSITION_LIMIT` in
+   the same direction it's already biased, skip. Position can flip directions;
+   it cannot pile on a saturated side. The Layer-2 per-mandate cap (gate 4)
+   only bounds individual mandate sizes — successive same-direction mandates
+   would otherwise stack unboundedly without this aggregate gate.
+7. **Hybrid drawdown** (`_max_drawdown_breached` calls both
+   `_is_drawdown_breached` and `_mtm_drawdown_breached`): trips kill switch
+   when *either*
+   - IS-based drawdown (accumulated execution-shortfall costs) exceeds
+     `MAX_SESSION_DRAWDOWN_USD` OR exceeds `MAX_SESSION_DRAWDOWN_PCT` of
+     `session_peak_pnl` once peak ≥ `DRAWDOWN_PCT_MIN_PEAK_USD`
+   - MTM-based drawdown (`cash + position·mid` from current order-book
+     snapshot) exceeds `MAX_MTM_DRAWDOWN_USD` OR exceeds
+     `MAX_MTM_DRAWDOWN_PCT` of `_mtm_peak_pnl` once peak ≥
+     `DRAWDOWN_PCT_MIN_PEAK_USD`.
+
+   Two gates because IS measures "how expensive are our fills" and MTM measures
+   "is the held position bleeding directionally." They diverge by orders of
+   magnitude under normal trading; either alone would miss a real risk class.
+   The kill-switch log includes which gate(s) tripped and the underlying
+   values for forensics.
+8. Unhandled exception → kill switch trips, all orders cancelled.
 
 A failure of any one gate stops the trade. There is no "best 2 of 3" logic.
+
+The IS drawdown formula uses a min-peak floor (`DRAWDOWN_PCT_MIN_PEAK_USD`)
+to suppress the percentage check below tiny peaks — `(peak − pnl) / peak` has
+unbounded leverage when `peak` is small (a $0.91 peak followed by a $9 loss
+is a 1000% "drawdown" trip on a 2% gate). The absolute USD cap is always
+active and is the primary safety stop; the percentage cap is secondary and
+only meaningful at production-relevant peak sizes.
 
 ### 3.5 The shadow agent never directly replaces the live agent
 
@@ -230,6 +266,61 @@ that touches the strategy loop or sensor lifecycle.
 
 This invariant is crypto-irrelevant (24/7 markets); it is enforced only
 when `IS_EQUITY` is true.
+
+### 3.8 Engine risk state must be reset alongside sensor state at session open
+
+Beyond the sensor reset documented in §3.7, the engine itself maintains
+per-session risk state — `_position`, `_cash`, `session_pnl`,
+`session_peak_pnl`, `_mtm_peak_pnl`, fee/notional accumulators — that must
+**also** be reset on close→open transitions, otherwise:
+
+- Yesterday's `session_peak_pnl` of e.g. $1500 carrying into today means a
+  first-trade $30 loss reads as a $1530 drawdown, false-tripping the IS gate
+  before the day's strategy has run.
+- Yesterday's `_position` and `_cash` carrying into today means today's MTM
+  is computed against today's mid using yesterday's positions — a
+  meaningless number that will likely trip the MTM gate immediately.
+- The drift monitor's rolling window includes shocks from yesterday's
+  closing regime that are no longer informative.
+
+`engine.Engine._reset_session_risk_state` is called immediately after
+`SensorArray.reset_session` on every detected market-open transition. It
+zeros the engine-side counters listed above and calls `drift_monitor.reset`
+if available. Crypto path: not invoked (24/7).
+
+This is the engine-side counterpart to §3.7. They were missing from the
+original implementation; the symptom in replay mode (where market-open never
+fires) was an MTM kill-switch trip whenever the harvested CSV stitched
+across a session boundary with a $50+ TSLA mid jump.
+
+### 3.9 Replay-mode mandate suppression
+
+`ReplaySensorArray` (test_replay.py) is the engine's off-market driver.
+When `config.REPLAY_CSV` is non-empty, `engine.py` swaps the live
+`SensorArray` for the replay shim, and the strategy loop runs against the
+historical CSV exactly as it would against a live feed — Layers 2/3/4 can't
+distinguish.
+
+Two replay-specific synthesis decisions:
+
+- **Order book is synthesized 1-level**, with bid_size and ask_size skewed
+  by the harvested OBI signal so `Q = |bid_total − ask_total|` is meaningful
+  (the matching engine walks only top-of-book for cross detection, so 1
+  level suffices for fill detection; market orders walk to depletion which
+  is unrealistic for large fills but fine for verifying pipeline plumbing).
+- **OOD `mahal_dist` is recomputed** from the loaded `OODDetector` rather
+  than read from the CSV. The CSV's `mahal_dist` column was produced under
+  whatever μ/Σ existed at harvest (typically identity prior, hence inflated
+  values); replay using the live calibrated detector matches what production
+  will compute.
+
+Risk-gate defaults loosen automatically when `REPLAY_CSV` is set
+(`MAX_MTM_DRAWDOWN_USD: 20000 → 1000000`,
+`MAX_MTM_DRAWDOWN_PCT: 0.10 → 10.0`). Reason: replay never hits
+"market open," so `_reset_session_risk_state` never fires across CSV
+session-boundary mid jumps, and tight production caps would trip
+non-deterministically based on which CSV segment the replay is in. Single
+unset of `REPLAY_CSV` restores production caps.
 
 ---
 
@@ -667,12 +758,16 @@ training data that the codebase scaffolds but doesn't ship:
 
 | Symptom                                       | First place to look                         |
 | --------------------------------------------- | ------------------------------------------- |
-| No mandates ever fire                         | `physics_state.ood_flag` always True? TCN trained? `TURBULENCE_THRESHOLD` too high? |
+| No mandates ever fire                         | `physics_state.ood_flag` always True? Check whether `latest_<SYMBOL>.json` exists — without calibration the cold-start identity prior makes Mahalanobis ≈ ‖x‖₂ and any large `ce_ratio` trips OOD. Run `fit_ood_from_csv.py`. Also verify TCN trained and `TURBULENCE_THRESHOLD` not too high. |
+| `MANDATE_SUPPRESSED_OOD` floods the log       | OOD calibration missing or stale. Boot log will say `cold-start prior` instead of `loaded calibration from ...`. Refit with `fit_ood_from_csv.py`. |
+| `MANDATE_SUPPRESSED_POSITION_LIMIT` floods    | Working as designed — Layer 2 keeps firing same-direction mandates but aggregate position is at cap. Check whether the OBI signal is genuinely one-sided or whether something upstream is biased. Position will unstick when OBI flips. |
 | Mandates fire but suppressed by attrition guard | `LAMBDA_SENSITIVITY_DELTA` too aggressive, or book genuinely fragile |
 | Lots of forced terminal fills                 | `BASE_EXECUTION_WINDOW` too short for current vpin levels; tune `GAMMA_INV` higher |
 | Shadow agent never promotes                   | KL stuck > 0.1 (training data covers a different regime than live), or replay too small |
-| Drawdown trip with no obvious cause           | Check fee-adjusted IS distribution — agent may have learned a passive-only policy that incurs terminal penalties |
+| `MAX DRAWDOWN BREACHED` with `is=True`        | Accumulated execution-cost runaway. Inspect `mean_IS` distribution in `_recent_episodes`; agent may be paying full spread on every fill. |
+| `MAX DRAWDOWN BREACHED` with `mtm=True`       | Directional exposure loss. Check `pos` and `peak_mtm` in the log line. Either the position is too big, or mid moved sharply. In replay, often a CSV session-boundary jump — confirm with mid in surrounding ticks. |
 | Drift monitor flips frequently                | Microstructure regime change (fee schedule? new HFT entrant?). Recalibrate immediately. |
+| Replay shows reasonable mahal_dist but live mode floods OOD | Live `OODDetector` somehow not loading `latest_<SYMBOL>.json` — verify calibration path and JSON schema. Boot log should report the loaded α value. |
 
 ---
 

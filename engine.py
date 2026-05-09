@@ -246,6 +246,7 @@ class Engine:
                 csv_path=config.REPLAY_CSV,
                 symbol=config.SYMBOL,
                 alpha_calibration_c=alpha_c,
+                ood_detector=ood,
             )
             log.info("ReplaySensorArray active; reading from %s", config.REPLAY_CSV)
         else:
@@ -327,6 +328,10 @@ class Engine:
         self._position: float = 0.0
         self._total_fees: float = 0.0
         self._total_filled_notional: float = 0.0
+        # MTM peak — high-water mark of (cash + position * mid) for the
+        # MTM drawdown gate. Updated lazily inside _mtm_drawdown_breached so we
+        # don't have to plumb the live mid into _update_session_pnl.
+        self._mtm_peak_pnl: float = 0.0
         self._recent_mandates: deque = deque(maxlen=256)
         self._recent_episodes: deque = deque(maxlen=50)
         # Per-fill order log — every step that resulted in a placement attempt.
@@ -473,10 +478,11 @@ class Engine:
                         await self._cancel_all_open_orders()
                         was_open = False
                     await self.session.wait_until_open()
-                    log.info("market open — resetting sensor state")
+                    log.info("market open — resetting sensor + risk state")
                     self.sensors.reset_session(
                         warmup_seconds=config.SESSION_WARMUP_SECONDS
                     )
+                    self._reset_session_risk_state()
                     # Clear any replay entries spanning the overnight gap so
                     # the shadow simulator doesn't mix sessions.
                     if hasattr(self.shadow_sim, "buffer") and \
@@ -496,13 +502,28 @@ class Engine:
                 if self.drift_monitor.is_stale:
                     continue
                 if self._max_drawdown_breached():
-                    log.error("MAX DRAWDOWN BREACHED — halting trading")
+                    is_breach = self._is_drawdown_breached()
+                    mtm_breach = self._mtm_drawdown_breached()
+                    log.error(
+                        "MAX DRAWDOWN BREACHED — halting trading "
+                        "(is=%s mtm=%s peak_is=$%.2f pnl_is=$%.2f peak_mtm=$%.2f pos=%.2f cash=$%.2f)",
+                        is_breach, mtm_breach,
+                        self.session_peak_pnl, self.session_pnl,
+                        self._mtm_peak_pnl, self._position, self._cash,
+                    )
                     config.TRADING_ENABLED = False
                     await self._cancel_all_open_orders()
                     break
 
                 mandate = self.alpha.evaluate(state)
                 if mandate is None:
+                    continue
+                if self._would_exceed_position_limit(mandate):
+                    log.info(
+                        "MANDATE_SUPPRESSED_POSITION_LIMIT: pos=%.2f dir=%+d size=%.2f limit=%.2f",
+                        self._position, int(mandate.direction),
+                        float(mandate.target_size), config.MAX_POSITION_LIMIT,
+                    )
                     continue
                 self._recent_mandates.append(mandate)
                 await self._execute_mandate(mandate)
@@ -649,6 +670,18 @@ class Engine:
         self.session_peak_pnl = max(self.session_peak_pnl, self.session_pnl)
 
     def _max_drawdown_breached(self) -> bool:
+        # Two parallel gates: the IS-based gate catches accumulated execution-
+        # cost drawdown (small numbers, governs "are our fills too expensive");
+        # the MTM gate catches directional exposure losses on the held position
+        # (much bigger numbers, governs "is the market moving against us").
+        # Either tripping halts trading.
+        if self._is_drawdown_breached():
+            return True
+        if self._mtm_drawdown_breached():
+            return True
+        return False
+
+    def _is_drawdown_breached(self) -> bool:
         drawdown_usd = self.session_peak_pnl - self.session_pnl
         if drawdown_usd <= 0:
             return False
@@ -663,6 +696,60 @@ class Engine:
         if self.session_peak_pnl < config.DRAWDOWN_PCT_MIN_PEAK_USD:
             return False
         return (drawdown_usd / self.session_peak_pnl) > config.MAX_SESSION_DRAWDOWN_PCT
+
+    def _mtm_drawdown_breached(self) -> bool:
+        """Mark-to-market drawdown gate: kills trading if `cash + position * mid`
+        drops too far from its session peak. Reads the latest mid from the
+        sensor's order-book snapshot. Returns False if no mid is available
+        (warming up, between sessions, etc.). Same hybrid USD + percent shape
+        as the IS gate so both share the same conceptual model."""
+        ob = getattr(self.sensors, "state", None)
+        ob = getattr(ob, "ob_snapshot", None) if ob is not None else None
+        if not ob or not ob.get("bids") or not ob.get("asks"):
+            return False
+        mid = 0.5 * (float(ob["bids"][0][0]) + float(ob["asks"][0][0]))
+        mtm_pnl = self._cash + self._position * mid
+        if mtm_pnl > self._mtm_peak_pnl:
+            self._mtm_peak_pnl = mtm_pnl
+        drawdown_usd = self._mtm_peak_pnl - mtm_pnl
+        if drawdown_usd <= 0:
+            return False
+        if drawdown_usd > config.MAX_MTM_DRAWDOWN_USD:
+            return True
+        if self._mtm_peak_pnl < config.DRAWDOWN_PCT_MIN_PEAK_USD:
+            return False
+        return (drawdown_usd / self._mtm_peak_pnl) > config.MAX_MTM_DRAWDOWN_PCT
+
+    def _would_exceed_position_limit(self, mandate) -> bool:
+        """Skip the mandate if executing it would push abs(position) further
+        past MAX_POSITION_LIMIT in the same direction it's already biased.
+        Position can still flip directions; can't pile up further on a
+        saturated side. layer2_alpha.py:264 caps each individual mandate's
+        target_size, but doesn't track running position — so successive
+        same-direction mandates can stack indefinitely without this gate."""
+        limit = config.MAX_POSITION_LIMIT
+        direction = int(getattr(mandate, "direction", 0))
+        if direction > 0 and self._position >= limit:
+            return True
+        if direction < 0 and self._position <= -limit:
+            return True
+        return False
+
+    def _reset_session_risk_state(self) -> None:
+        """Wipe per-session PnL/position counters at market open. Prevents
+        stale state from a prior session bleeding into a fresh open's risk
+        gates — e.g., if session_peak_pnl carried over a $1000 peak from
+        yesterday, today's first $20 loss falsely looks like 100% drawdown.
+        Sensor + HMM + Kalman are reset separately by SensorArray.reset_session."""
+        self._position = 0.0
+        self._cash = 0.0
+        self._total_fees = 0.0
+        self._total_filled_notional = 0.0
+        self.session_pnl = 0.0
+        self.session_peak_pnl = 0.0
+        self._mtm_peak_pnl = 0.0
+        if hasattr(self.drift_monitor, "reset"):
+            self.drift_monitor.reset()
 
     async def _cancel_all_open_orders(self) -> None:
         try:

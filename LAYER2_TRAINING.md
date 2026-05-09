@@ -496,3 +496,160 @@ python -u engine.py 2>&1 | Tee-Object -FilePath engine_smoke_TSLA.log
 
 The drawdown gate restores to 2 % when the env var is unset, so
 production safety holds for the live test.
+
+## 11. Hardening pass (2026-05-09, evening)
+
+After the §10 smoke test confirmed the pipeline runs end-to-end, a
+deeper audit of the engine's risk surface and the replay's OOD
+behavior surfaced four more issues that would make Monday's RTH
+results misleading even with the pipeline "working." This section
+records the fixes and the final layer-by-layer strategy.
+
+### 11.1 Issues found in audit
+
+1. **OOD detector ran on the cold-start prior** because no
+   `latest_TSLA.json` existed. The frozen identity-Σ produced
+   `mahal_dist ≈ ‖x‖₂`, flagging any tick with `ce_ratio > ~4.5` as
+   out-of-distribution. The replay's first run mass-suppressed
+   ~70 % of mandates with `MANDATE_SUPPRESSED_OOD: mahal_dist=50`
+   storms.
+
+2. **No aggregate position limit.** `MAX_POSITION_LIMIT` was checked
+   per-mandate (layer2_alpha.py:264) but not against running
+   `_position` (engine.py:619, 622). Successive same-direction
+   mandates stacked unboundedly — observed +797 share TSLA position
+   against the documented 100-share cap. Drove wild MTM swings.
+
+3. **Drawdown gate measured the wrong PnL.** `_max_drawdown_breached`
+   used `session_pnl` (execution-shortfall, $10s of dollars) but the
+   real risk lived in `theoretical_pnl = cash + position·mid` (MTM,
+   could swing $1000+). The gate could not see directional exposure
+   losses.
+
+4. **Replay's `mahal_dist` was stale.** `ReplaySensorArray` read the
+   `mahal_dist` column from the CSV — values computed during the
+   original harvest with whatever prior existed at that time
+   (typically identity). The new calibrated detector loaded into the
+   engine wasn't being used. Replay dashboards showed
+   `mahal_dist` values orders of magnitude larger than what live
+   mode would compute.
+
+### 11.2 Fixes (committed)
+
+1. **OOD calibration.** Ran `fit_ood_from_csv.py` against the 47M-row
+   `feature_history_TSLA_balanced.csv`, producing
+   `calibration/latest_TSLA.json` with
+   `μ = [41.0348, -0.0038, 0.0000]`,
+   `Σ_diag = [195.84, 0.164, 0.0]`. The singular `liq` covariance
+   reflects equity's disabled liquidation tracker; the
+   `OODDetector._set_inverse` 1e-6 jitter handles it. Engine boot
+   now logs `loaded calibration from .../latest_TSLA.json` instead
+   of `cold-start prior`.
+
+2. **Aggregate position-limit gate** (`engine._would_exceed_position_limit`).
+   In the strategy loop, a mandate that would push `abs(_position)`
+   further past `MAX_POSITION_LIMIT` in the *same direction it's
+   already biased* is suppressed and logged as
+   `MANDATE_SUPPRESSED_POSITION_LIMIT`. Position can still flip
+   directions; just cannot pile on a saturated side.
+
+3. **Hybrid IS + MTM drawdown gate.** `_max_drawdown_breached` now
+   composes two parallel checks:
+   - `_is_drawdown_breached` (existing, IS-based, $1K USD or 2 %)
+   - `_mtm_drawdown_breached` (new, reads `cash + position·mid`,
+     defaults $20K USD or 10 % in live mode, $1M / 1000% in replay
+     mode to absorb CSV session-boundary jumps).
+   The kill-switch log line now reports which gate(s) tripped and
+   the underlying values (`is=… mtm=… peak_is=… pnl_is=… peak_mtm=…
+   pos=… cash=…`). Both caps are env-overridable.
+
+4. **Session reset on market open** (`_reset_session_risk_state`).
+   On every detected close→open transition, `_position`, `_cash`,
+   `session_pnl`, `session_peak_pnl`, `_mtm_peak_pnl`, fee/notional
+   counters are zeroed. Prevents stale peaks from yesterday tripping
+   today's gates after sub-cent moves. Wired beside the existing
+   `SensorArray.reset_session` call so the lifecycle is unified.
+
+5. **Replay's OOD now uses the live detector.**
+   `ReplaySensorArray.__init__` accepts `ood_detector` (passed by
+   engine.py from the calibration-loaded `OODDetector`). Each row's
+   `mahal_dist` is recomputed via `ood_detector.evaluate(...)` against
+   the calibrated μ/Σ rather than read from the CSV. The CSV column
+   is now ignored when a detector is available. After this fix,
+   replay's mahal_dist range dropped from 5–50 to 0.5–3.0 — matching
+   what live mode produces.
+
+6. **Mode-conditional MTM defaults** (`config.py` REPLAY_CSV branch).
+   Live mode uses tight production caps; replay mode uses caps that
+   absorb CSV concatenation artifacts. Single-variable swap (unset
+   REPLAY_CSV) restores live caps for Monday RTH.
+
+7. **Dashboard gains a second drawdown panel** (`dashboard.html`,
+   `dashboard.py`). Top row now shows IS Drawdown and MTM Drawdown
+   side-by-side with their respective sublabels (`max $1000 or
+   2.00%`, `max $20000 or 10.00%`). Theoretical P&L's "BTC" hardcode
+   was replaced with a symbol-aware unit (`sh` for equities, base
+   currency for crypto pairs).
+
+### 11.3 Test coverage
+
+`test_engine.py` (NEW): 15 tests covering all six IS-drawdown cases
+plus four position-limit cases (long cap, short cap, allow-flip,
+allow-buy-when-short), four MTM cases (no-OB, USD trip, sub-cap,
+percent trip), and two session-reset cases. `test_replay.py`
+expanded to 5 tests including OOD-flag-derived-from-threshold and
+OBI-skewed depth synthesis. Total project test count: 21 passing.
+
+### 11.4 Final per-layer strategy and current state
+
+| Layer | What it does | Current state | What's calibrated | What's deferred |
+|---|---|---|---|---|
+| 1 — Sensors | VPIN, Kalman, HMM, OOD, regime, OBI | Operational | OOD μ/Σ from 47M rows; HMM cold-start prior | HMM emission re-fit (operator job); session-aware reset wired |
+| 2 — Alpha | TCN turbulence + heat-equation P_eq + 4 gates | Operational | TCN trained, threshold tuned, OOD gate calibrated | None for defense; focal loss could lift TSLA F2 |
+| 3 — Execution | ExecutionEnv + PPO routing + LocalMatchingEngine | **Random-init each session**; trains online via Layer 4 | Action-space, reward shaping, fee adjustment | PPO weights persistence (defer post-defense) |
+| 4 — Shadow | ReplayBuffer + PPOTrainer + StabilityGate + Polyak | Operational; collects on every episode step | KL=0.1, regime match, 50K-step minimum | Promotion observed in live demo; needs longer run for stability gate to fire |
+| Risk gates | Position limit, IS DD, MTM DD, OOD, drift | All operational, env-overridable | Default caps sized to per-symbol limits | Replay session-boundary detection (cosmetic) |
+| Replay shim | `test_replay.ReplaySensorArray` | Operational; OOD recomputes from live detector | Synthesized 1-level book, OBI-skewed depth | Multi-level book synthesis (post-defense) |
+
+### 11.5 Defense-narrative claims that are supportable
+
+- *"Layer 2 TCN trained on TSLA harvest, F1=0.514, threshold tuned
+  via post-train sweep. Cross-symbol matrix shows the model
+  generalizes between trainable-density symbols (TSLA→NVDA F1=0.691)
+  while density-bottlenecked on PLTR-class symbols (~0.05% positive
+  density)."*
+- *"End-to-end pipeline operates in shadow mode against either live
+  Alpaca IEX or harvested CSV via a single env-var swap."*
+- *"Five risk gates engage independently: TCN turbulence threshold,
+  OOD Mahalanobis (calibrated), aggregate position limit, hybrid
+  IS+MTM drawdown, and drift monitor."*
+- *"Layer 4 collects training data from every episode step. After
+  ~50,000 environment steps the stability gate clears and Polyak
+  averaging promotes the shadow policy to live, with three
+  independent gating conditions."*
+
+### 11.6 Defense claims to AVOID
+
+- *"Strategy is profitable."* — No backtest with held-out data;
+  replay smoke shows -$1K range MTM losses on 30-second runs because
+  PPO is random-init and pays round-trip spread costs. Profitability
+  is post-defense work requiring trained PPO weights.
+- *"PPO is trained."* — Random init each session. Online learning
+  via Layer 4 has barely started in any single session.
+- *"Production-ready for live capital."* — `_live_submit` is a stub
+  (layer3_execution.py:334). Full live order path needs a real
+  Alpaca POST-orders integration. Defense is shadow-mode by design.
+
+### 11.7 Monday RTH command
+
+Same as the §10 command — defaults already produce correct live
+behavior:
+
+```powershell
+$env:SYMBOL = "TSLA"
+python -u engine.py 2>&1 | Tee-Object -FilePath engine_smoke_TSLA_monday.log
+```
+
+`REPLAY_CSV` unset → live Alpaca path, tight MTM caps ($20K USD,
+10 % peak-relative), `latest_TSLA.json` auto-loads, position cap at
+100 shares, all gates active. Session reset fires on market open.

@@ -11,9 +11,11 @@ import asyncio
 import os
 from pathlib import Path
 
+import numpy as np
 import polars as pl
 import pytest
 
+import config
 from layer1_sensors import PhysicsState
 
 REPLAY_TICK_SECONDS = float(os.environ.get("REPLAY_TICK_SECONDS", "0.05"))
@@ -31,13 +33,19 @@ class ReplaySensorArray:
     .stop(), .reset_session(warmup_seconds), and .state attribute.
     """
 
-    def __init__(self, csv_path: str, symbol: str, alpha_calibration_c: float, **_):
-        # Accept and ignore SensorArray's other kwargs (exchange, ood_detector,
-        # hmm, liquidation_tracker, feature_dumper) so engine.py's existing
-        # construction site doesn't have to branch on argument shape.
+    def __init__(self, csv_path: str, symbol: str, alpha_calibration_c: float,
+                 ood_detector=None, **_):
+        # Accept (optionally) the engine's pre-loaded OODDetector so we can
+        # recompute mahal_dist against the calibrated μ/Σ instead of using the
+        # CSV's stored value (which was computed with the identity-prior at
+        # harvest time and is meaningless once latest_*.json exists).
+        # The remaining SensorArray kwargs (exchange, hmm, liquidation_tracker,
+        # feature_dumper) are absorbed silently so engine.py doesn't have to
+        # branch the construction site by argument shape.
         self._csv_path = Path(csv_path)
         self._symbol = symbol
         self._alpha_c = float(alpha_calibration_c)
+        self._ood = ood_detector
         # ob_snapshot=None on the default — strategy loop holds at engine.py:473
         # until the first row arrives.
         self.state = PhysicsState()
@@ -79,6 +87,21 @@ class ReplaySensorArray:
         spread_velocity = spread - self._prev_spread
         self._prev_ob = ob
         self._prev_spread = spread
+        # Compute mahal_dist from the loaded OODDetector if available; this
+        # mirrors what live SensorArray does at layer1_sensors.py:896. The CSV
+        # column's value was produced with whatever μ/Σ existed at harvest
+        # (likely identity-prior, hence inflated 50+ values), so prefer the
+        # in-memory calibrated detector when present.
+        if self._ood is not None:
+            tcn_obs = np.array([
+                float(row["ce_ratio"]),
+                float(row["obi"]),
+                float(row["liquidation_rate"]),
+            ])
+            ood_flag, mahal = self._ood.evaluate(tcn_obs)
+        else:
+            mahal = float(row["mahal_dist"])
+            ood_flag = mahal > config.OOD_THRESHOLD
         return PhysicsState(
             vpin=float(row["vpin"]),
             alpha_calibrated=self._alpha_c,
@@ -86,10 +109,8 @@ class ReplaySensorArray:
             viscosity=max(spread, 1e-4),
             regime=int(row["regime"]),
             liquidation_rate=float(row["liquidation_rate"]),
-            # CSV's mahal_dist already reflects the harvest-time OOD detector;
-            # don't re-suppress mandates by recomputing the flag here.
-            ood_flag=False,
-            mahal_dist=float(row["mahal_dist"]),
+            ood_flag=bool(ood_flag),
+            mahal_dist=float(mahal),
             ce_ratio=float(row["ce_ratio"]),
             obi=float(row["obi"]),
             spread_velocity=spread_velocity,
@@ -132,6 +153,16 @@ def test_row_to_state_populates_required_fields(sample_row):
     assert s.regime == 0
     assert s.viscosity > 0  # solver-safe
     assert s.alpha_calibrated == pytest.approx(0.25)
+
+
+def test_ood_flag_derived_from_threshold(sample_row):
+    arr = ReplaySensorArray(csv_path="<unused>", symbol="TSLA", alpha_calibration_c=0.0)
+    # mahal_dist=1.5 (< OOD_THRESHOLD=4.5) → in-distribution
+    s_in = arr._row_to_state({**sample_row, "mahal_dist": 1.5})
+    assert s_in.ood_flag is False
+    # mahal_dist=50 (>> OOD_THRESHOLD) → flagged so AlphaEngine suppresses
+    s_out = arr._row_to_state({**sample_row, "mahal_dist": 50.0})
+    assert s_out.ood_flag is True
 
 
 def test_obi_skews_synthesized_depth(sample_row):

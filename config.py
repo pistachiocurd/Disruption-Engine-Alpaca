@@ -252,6 +252,37 @@ MAX_SESSION_DRAWDOWN_PCT = float(
 DRAWDOWN_PCT_MIN_PEAK_USD = float(
     os.environ.get("DRAWDOWN_PCT_MIN_PEAK_USD", "100.0")
 )
+
+# MTM (mark-to-market) drawdown — same hybrid USD + percent gate, but on
+# theoretical_pnl (cash + position * mid). The IS-based gate above only sees
+# accumulated execution-shortfall costs (~$10s of dollars), so a position
+# accumulating $20K of directional exposure loss can sail past the IS gate
+# undetected. MTM gate catches that.
+#
+# Defaults split by mode:
+#   - LIVE (REPLAY_CSV unset): tight production caps. A 100-share TSLA position
+#     (~$44K notional) trips at $20K USD (~45% adverse move) or 10% peak-relative.
+#   - REPLAY: loose caps. The harvested CSV concatenates 73 sessions; replay
+#     never hits a "market open" event, so _position and _cash never reset
+#     across CSV session boundaries. Mid can jump 40%+ at a session join,
+#     which trips the production caps almost immediately. Loosening for
+#     replay-mode demos is a workaround for the missing reset; live RTH gets
+#     full production safety.
+# Env vars override either default explicitly.
+if REPLAY_CSV:
+    MAX_MTM_DRAWDOWN_USD = float(
+        os.environ.get("MAX_MTM_DRAWDOWN_USD", "1_000_000.0")
+    )
+    MAX_MTM_DRAWDOWN_PCT = float(
+        os.environ.get("MAX_MTM_DRAWDOWN_PCT", "10.0")
+    )
+else:
+    MAX_MTM_DRAWDOWN_USD = float(
+        os.environ.get("MAX_MTM_DRAWDOWN_USD", "20000.0")
+    )
+    MAX_MTM_DRAWDOWN_PCT = float(
+        os.environ.get("MAX_MTM_DRAWDOWN_PCT", "0.10")
+    )
 KILL_SWITCH_LOG_PATH = "./logs/kill_switch.log"
 
 # ============================================================================

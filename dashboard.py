@@ -40,10 +40,43 @@ def _ask(ob: Any) -> float | None:
     return None
 
 
+def _drawdown_usd(engine) -> float:
+    """Absolute dollar drawdown from peak. Always meaningful, never pathological."""
+    return max(0.0, engine.session_peak_pnl - engine.session_pnl)
+
+
 def _drawdown_pct(engine) -> float:
+    """Percentage drawdown — only meaningful once peak exceeds the floor below
+    which the ratio explodes (a $0.91 peak with -$9 PnL is not "1000% drawdown",
+    it's noise on a tiny base). Mirrors the gate logic in
+    engine._max_drawdown_breached so the display agrees with the kill-switch."""
+    if engine.session_peak_pnl < config.DRAWDOWN_PCT_MIN_PEAK_USD:
+        return 0.0
     if engine.session_peak_pnl <= 0:
         return 0.0
     return (engine.session_peak_pnl - engine.session_pnl) / engine.session_peak_pnl
+
+
+def _mtm_drawdown_usd(engine, mid: float | None) -> float:
+    """Absolute MTM drawdown from peak. Returns 0 when no mid is available
+    (warmup, between sessions, etc.) — matches the gate behavior in
+    engine._mtm_drawdown_breached."""
+    if mid is None:
+        return 0.0
+    mtm_pnl = float(getattr(engine, "_cash", 0.0)) + float(getattr(engine, "_position", 0.0)) * mid
+    peak = float(getattr(engine, "_mtm_peak_pnl", 0.0))
+    return max(0.0, peak - mtm_pnl)
+
+
+def _mtm_drawdown_pct(engine, mid: float | None) -> float:
+    """Percentage MTM drawdown — same floor logic as the IS gate."""
+    if mid is None:
+        return 0.0
+    peak = float(getattr(engine, "_mtm_peak_pnl", 0.0))
+    if peak < config.DRAWDOWN_PCT_MIN_PEAK_USD or peak <= 0:
+        return 0.0
+    mtm_pnl = float(getattr(engine, "_cash", 0.0)) + float(getattr(engine, "_position", 0.0)) * mid
+    return max(0.0, (peak - mtm_pnl) / peak)
 
 
 def _episode_to_dict(rec: dict) -> dict:
@@ -98,7 +131,20 @@ class DashboardServer:
                 "session_pnl": float(e.session_pnl),
                 "session_peak_pnl": float(e.session_peak_pnl),
                 "drawdown_pct": float(_drawdown_pct(e)),
+                "drawdown_usd": float(_drawdown_usd(e)),
                 "max_drawdown_pct": float(config.MAX_SESSION_DRAWDOWN_PCT),
+                "max_drawdown_usd": float(config.MAX_SESSION_DRAWDOWN_USD),
+                "drawdown_pct_min_peak_usd": float(config.DRAWDOWN_PCT_MIN_PEAK_USD),
+                # MTM drawdown — see engine._mtm_drawdown_breached. Distinct
+                # from the IS drawdown above because IS only sees execution
+                # cost while MTM sees directional exposure losses.
+                "mtm_peak_pnl": float(getattr(e, "_mtm_peak_pnl", 0.0)),
+                "mtm_drawdown_usd": float(_mtm_drawdown_usd(e, mid)),
+                "mtm_drawdown_pct": float(_mtm_drawdown_pct(e, mid)),
+                "max_mtm_drawdown_usd": float(config.MAX_MTM_DRAWDOWN_USD),
+                "max_mtm_drawdown_pct": float(config.MAX_MTM_DRAWDOWN_PCT),
+                "is_equity": bool(config.IS_EQUITY),
+                "max_position_limit": float(config.MAX_POSITION_LIMIT),
                 # Theoretical PnL (would-be fills MTM'd at live mid).
                 "pnl_theoretical": float(theoretical_pnl),
                 "pnl_cash": float(cash),

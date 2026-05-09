@@ -79,7 +79,8 @@
   <div class="panel stat"><h2>Mode</h2><div class="v" id="mode">—</div><div class="sub" id="trading_enabled">—</div></div>
   <div class="panel stat"><h2>Regime</h2><div class="v" id="regime">—</div><div class="sub">HMM dominant</div></div>
   <div class="panel stat"><h2>OOD</h2><div class="v" id="ood">—</div><div class="sub" id="ood_thresh">thresh —</div></div>
-  <div class="panel stat"><h2>Drawdown</h2><div class="v" id="drawdown">—</div><div class="sub" id="drawdown_max">max —</div></div>
+  <div class="panel stat"><h2>IS Drawdown</h2><div class="v" id="drawdown">—</div><div class="sub" id="drawdown_max">max —</div></div>
+  <div class="panel stat"><h2>MTM Drawdown</h2><div class="v" id="mtm_drawdown">—</div><div class="sub" id="mtm_drawdown_max">max —</div></div>
   <div class="panel stat"><h2>Calibration</h2><div class="v" id="cal_status">—</div><div class="sub" id="drift_mape">MAPE —</div></div>
   <div class="panel stat"><h2>Theoretical P&amp;L</h2><div class="v" id="pnl_total">—</div><div class="sub" id="pnl_sub">—</div></div>
 </div>
@@ -399,12 +400,39 @@ async function tick() {
       "thresh " + fmt(s.physics_state.ood_threshold, 1) +
       (s.physics_state.ood_flag ? " — OOD" : " — in-dist");
 
-    const dd = s.engine.drawdown_pct;
-    const ddEl = document.getElementById("drawdown");
-    ddEl.textContent = (dd * 100).toFixed(2) + "%";
-    ddEl.className = "v " + (dd > s.engine.max_drawdown_pct ? "bad" : (dd > 0.5 * s.engine.max_drawdown_pct ? "warn" : "ok"));
-    document.getElementById("drawdown_max").textContent =
-      "max " + (s.engine.max_drawdown_pct * 100).toFixed(2) + "%";
+    // IS-based drawdown — measures accumulated execution-shortfall costs.
+    // Show USD primarily (always meaningful); show % only when peak exceeds
+    // the floor (otherwise the ratio is pathological on tiny bases).
+    const minPeak = s.engine.drawdown_pct_min_peak_usd || 0;
+    const renderDrawdown = (elId, subId, ddUsd, ddPct, peak, maxUsd, maxPct, label) => {
+      const el = document.getElementById(elId);
+      if (peak >= minPeak && ddPct > 0) {
+        el.textContent = "$" + fmt(ddUsd, 2) + " · " + (ddPct * 100).toFixed(2) + "%";
+      } else {
+        el.textContent = "$" + fmt(ddUsd, 2);
+      }
+      const usdBreached = ddUsd > maxUsd;
+      const pctBreached = peak >= minPeak && ddPct > maxPct;
+      const usdWarn = ddUsd > 0.5 * maxUsd;
+      const pctWarn = peak >= minPeak && ddPct > 0.5 * maxPct;
+      el.className = "v " + ((usdBreached || pctBreached) ? "bad" : ((usdWarn || pctWarn) ? "warn" : "ok"));
+      document.getElementById(subId).textContent =
+        "max $" + fmt(maxUsd, 0) + " or " + (maxPct * 100).toFixed(2) + "%";
+    };
+    renderDrawdown(
+      "drawdown", "drawdown_max",
+      s.engine.drawdown_usd || 0, s.engine.drawdown_pct || 0,
+      s.engine.session_peak_pnl || 0,
+      s.engine.max_drawdown_usd || 0, s.engine.max_drawdown_pct || 0,
+      "IS",
+    );
+    renderDrawdown(
+      "mtm_drawdown", "mtm_drawdown_max",
+      s.engine.mtm_drawdown_usd || 0, s.engine.mtm_drawdown_pct || 0,
+      s.engine.mtm_peak_pnl || 0,
+      s.engine.max_mtm_drawdown_usd || 0, s.engine.max_mtm_drawdown_pct || 0,
+      "MTM",
+    );
 
     const calEl = document.getElementById("cal_status");
     calEl.textContent = s.engine.calibration_stale ? "STALE" : "OK";
@@ -467,8 +495,13 @@ async function tick() {
     pnlEl.className = "v " + (pnl > 0 ? "ok" : (pnl < 0 ? "bad" : ""));
     const pos = s.engine.pnl_position || 0;
     const fees = s.engine.pnl_total_fees || 0;
+    // Position unit: shares for equities, the base symbol for crypto pairs
+    // (e.g., "BTC" from "BTC/USD"). Hardcoded "BTC" was a crypto-era leftover.
+    const posUnit = s.engine.is_equity
+      ? "sh"
+      : (s.engine.symbol || "").split("/")[0] || "units";
     document.getElementById("pnl_sub").textContent =
-      `pos ${fmt(pos, 4)} BTC · fees $${fmt(fees, 2)}`;
+      `pos ${fmt(pos, 4)} ${posUnit} · fees $${fmt(fees, 2)}`;
 
     // Charts
     pushChart(charts.vpin, s.physics_state.vpin);

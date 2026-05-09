@@ -66,15 +66,23 @@ and re-enables the Binance liquidation feed if `EXCHANGE_ID=binance`.
 
 ## Critical environment variables
 
-| Variable             | Purpose                                                                                       |
-| -------------------- | --------------------------------------------------------------------------------------------- |
-| `EXCHANGE_ID`        | `alpaca` (default), `coinbaseadvanced`, `binance`. Auto-selected by `SYMBOL` shape if unset.  |
-| `SYMBOL`             | Equity ticker (e.g. `NVDA`, `SPY`) or crypto pair (e.g. `BTC/USD`). Default `NVDA`.           |
-| `ALPACA_DATA_FEED`   | `iex` (free, default) or `sip` (Algo Trader Plus). Equities only.                             |
-| `EXCHANGE_API_KEY`   | Alpaca paper/live API key, or Coinbase CDP key name. Disable withdrawal scopes.               |
-| `EXCHANGE_SECRET`    | Matching secret. Stored in env, never on disk.                                                |
-| `EXCHANGE_LIVE`      | Set to literal `"true"` to disable paper / sandbox.                                           |
-| `LOG_LEVEL`          | `DEBUG`, `INFO` (default), `WARNING`.                                                         |
+| Variable                     | Purpose                                                                                       |
+| ---------------------------- | --------------------------------------------------------------------------------------------- |
+| `EXCHANGE_ID`                | `alpaca` (default), `coinbaseadvanced`, `binance`. Auto-selected by `SYMBOL` shape if unset.  |
+| `SYMBOL`                     | Equity ticker (e.g. `NVDA`, `SPY`) or crypto pair (e.g. `BTC/USD`). Default `NVDA`.           |
+| `ALPACA_DATA_FEED`           | `iex` (free, default) or `sip` (Algo Trader Plus). Equities only.                             |
+| `EXCHANGE_API_KEY`           | Alpaca paper/live API key, or Coinbase CDP key name. Disable withdrawal scopes.               |
+| `EXCHANGE_SECRET`            | Matching secret. Stored in env, never on disk.                                                |
+| `EXCHANGE_LIVE`              | Set to literal `"true"` to disable paper / sandbox.                                           |
+| `LOG_LEVEL`                  | `DEBUG`, `INFO` (default), `WARNING`.                                                         |
+| `REPLAY_CSV`                 | Path to a `feature_history_*.csv` for off-market replay smoke testing. When set, the engine swaps `SensorArray` for `ReplaySensorArray` (test_replay.py), skips Alpaca init, and skips the market-hours gate. Unset → live Alpaca feed. See "Replay smoke testing" below. |
+| `REPLAY_TICK_SECONDS`        | Per-row sleep in replay mode. Default `0.05` (matches engine's 50ms tick). Lower for faster fast-forward.                                  |
+| `MAX_SESSION_DRAWDOWN_USD`   | Absolute USD cap on IS-based session drawdown. Default `1000.0`.                              |
+| `MAX_SESSION_DRAWDOWN_PCT`   | Percentage cap on IS-based drawdown, active only when peak ≥ `DRAWDOWN_PCT_MIN_PEAK_USD`. Default `0.02` (2%).        |
+| `DRAWDOWN_PCT_MIN_PEAK_USD`  | Floor below which the percentage gate is skipped (avoids the unbounded-leverage formula on tiny peaks). Default `100.0`. |
+| `MAX_MTM_DRAWDOWN_USD`       | Absolute USD cap on mark-to-market drawdown. Live default `20000.0`; replay default `1000000.0` (CSV session-boundary jumps would otherwise trip the live cap).               |
+| `MAX_MTM_DRAWDOWN_PCT`       | Percentage cap on MTM drawdown. Live default `0.10` (10%); replay default `10.0` (effectively disabled).         |
+| `MAX_POSITION_LIMIT`         | Per-symbol aggregate position cap. Default loaded from `_PAIR_DEFAULTS` (TSLA: 100, NVDA: 200, SPY: 500, BTC/USD: 0.5, etc.).                            |
 
 ## Operational toggles in `config.py`
 
@@ -243,25 +251,92 @@ disruption_arbitrage_engine/
 ├── README.md                 # this file
 ├── IMPLEMENTATION.md         # full architectural rationale and runbooks
 ├── LAYER2_TRAINING.md        # TCN training research log: data, densities, results
-└── tests/
-    ├── test_sensors.py
-    ├── test_calibration.py
-    ├── test_matching_engine.py
-    ├── test_alpha.py
-    └── test_execution.py
+└── tests/  (top-level test_*.py files, not a package)
+    ├── test_sensors.py            # layer1 unit tests
+    ├── test_calibration.py        # calibration helpers
+    ├── test_matching_engine.py    # LocalMatchingEngine + structural isolation
+    ├── test_alpha.py              # AlphaEngine mandate gates
+    ├── test_execution.py          # ExecutionEnv + PPO contract
+    ├── test_engine.py             # Engine risk gates: drawdown (IS+MTM), position limit, session reset
+    └── test_replay.py             # ReplaySensorArray shim + replay-mode pytest cases
 ```
 
 ## Safety constraints
 
-- The matching engine **cannot** place real orders. Structural assertion at import.
-- API keys must have **withdrawals disabled**.
-- `EXCHANGE_LIVE=true` is required to leave paper / sandbox.
-- Session drawdown > 2% halts trading via the drawdown kill switch.
-- Calibration drift (rolling MAPE > 0.35) suspends mandate generation.
-- OOD detector blocks mandates when the live observation is outside the
-  training manifold by Mahalanobis distance.
-- Equities: no mandates fire while the market is closed; sensor state is
-  reset at every market open to prevent overnight-gap drift.
+The engine has five independent risk gates plus structural isolation. Each
+trips trading, and each is unit-tested:
+
+- **Structural**: `matching_engine.py` cannot place real orders — import-time
+  assertion. API keys must have **withdrawals disabled**. `EXCHANGE_LIVE=true`
+  is required to leave paper.
+- **OOD gate**: `OODDetector` blocks mandates when the live observation lies
+  outside the calibrated training manifold by Mahalanobis distance > 4.5.
+  Calibration is loaded from `calibration/latest_<SYMBOL>.json` at boot;
+  cold-start prior used as fallback (regenerate via
+  `fit_ood_from_csv.py`).
+- **Aggregate position limit**: `MAX_POSITION_LIMIT` is enforced both
+  per-mandate (in `AlphaEngine`) AND aggregate (`engine._would_exceed_position_limit`).
+  Mandates that would push position further past the cap in the same direction
+  are suppressed and logged as `MANDATE_SUPPRESSED_POSITION_LIMIT`.
+- **Hybrid drawdown gate**: trips trading when EITHER
+  - the IS-based drawdown (accumulated execution-shortfall costs)
+    exceeds `MAX_SESSION_DRAWDOWN_USD` ($1K default), OR exceeds
+    `MAX_SESSION_DRAWDOWN_PCT` (2%) once peak ≥ `DRAWDOWN_PCT_MIN_PEAK_USD` ($100), OR
+  - the MTM-based drawdown (mark-to-market on `cash + position·mid`) exceeds
+    `MAX_MTM_DRAWDOWN_USD` ($20K live / $1M replay), OR exceeds
+    `MAX_MTM_DRAWDOWN_PCT` (10% live / 1000% replay) above the same floor.
+
+  The kill-switch log line reports which gate(s) tripped and the underlying
+  values for forensics.
+- **Calibration drift**: rolling MAPE > 0.35 → strategy loop self-suspends
+  until offline recalibration produces a fresh `latest_<SYMBOL>.json`.
+- **Session boundary**: equities only — no mandates fire while the market is
+  closed; on every detected close→open transition, both `SensorArray` state
+  (HMM, Kalman, VPIN, CE) AND engine risk state (position, cash, PnL peaks)
+  are reset to prevent overnight-gap drift and stale-peak gate trips.
+
+## Replay smoke testing
+
+When markets are closed (or for off-market verification), the engine can be
+driven from a harvested `feature_history_*.csv` via the replay shim. This
+exercises Layers 2/3/4 + dashboard end-to-end against historical data without
+touching Alpaca:
+
+```powershell
+$env:SYMBOL = "TSLA"
+$env:REPLAY_CSV = "calibration/feature_history_TSLA_balanced.csv"
+python -u engine.py 2>&1 | Tee-Object -FilePath replay_smoke.log
+```
+
+How it works:
+
+- `engine.py` checks `config.REPLAY_CSV` at boot. If non-empty, it skips
+  Alpaca init, skips `SessionManager` (no market-hours gate), and instantiates
+  `ReplaySensorArray` from `test_replay.py` instead of `SensorArray`.
+- `ReplaySensorArray` streams the CSV in polars batches and yields one
+  `PhysicsState` per row. The CSV's pre-computed `mahal_dist` is **ignored**;
+  instead the live calibrated `OODDetector` is invoked to recompute distance
+  against the loaded μ/Σ. Other features (ce_ratio, obi, vpin, regime) pass
+  through unchanged.
+- Order book snapshots are synthesized 1-level with depth skewed by OBI so
+  the heat solver's shock-volume calculation `Q = |bid_total - ask_total|`
+  reflects the harvested OBI signal. `LocalMatchingEngine` walks only
+  top-of-book for cross detection, so 1 level suffices for fills.
+- Risk-gate defaults loosen automatically in replay mode (`MAX_MTM_DRAWDOWN_USD`
+  $20K → $1M) to absorb CSV session-boundary mid jumps. Production caps return
+  the moment `REPLAY_CSV` is unset — single-variable swap to live.
+
+Returning to live mode for Monday RTH:
+
+```powershell
+Remove-Item Env:REPLAY_CSV
+$env:SYMBOL = "TSLA"
+python -u engine.py 2>&1 | Tee-Object -FilePath engine_smoke_TSLA.log
+```
+
+`test_replay.py` doubles as a pytest module (5 tests verifying the shim's
+`PhysicsState` construction and OOD passthrough); replay logic and tests
+co-locate in the same file.
 
 ## Required validation before going live
 
