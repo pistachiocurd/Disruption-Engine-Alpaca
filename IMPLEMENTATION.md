@@ -695,3 +695,8 @@ live:
 | Fee-adjusted IS                                     | `ExecutionEnv._step_is_fee_adj()`              |
 | GAE                                                 | `PPOTrainer._compute_gae()`                    |
 | Polyak `θ ← τθ_shadow + (1-τ)θ`                     | `polyak_update()`                              |
+
+
+---
+
+**Layer 2 (TCN) training findings, dataset inventory, density thresholds, and per-symbol results live in [LAYER2_TRAINING.md](LAYER2_TRAINING.md).** That document is updated as new training runs land, while this one stays focused on engine architecture and runbook material.

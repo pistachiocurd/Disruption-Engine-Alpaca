@@ -3,24 +3,64 @@ __pycache__/
 *.pyc
 *.pyo
 *.pyd
+*.so
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+.tox/
+
+# Python packaging
+build/
+dist/
+*.egg-info/
+*.egg
+pip-wheel-metadata/
 
 # Virtual environments
 .venv/
 venv/
 env/
+ENV/
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# Coverage / test reports
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
 
 # Editor / IDE
 .vscode/
 .idea/
 *.swp
+*.swo
+*~
+*.bak
+*.orig
 .DS_Store
+
+# Windows OS
+Thumbs.db
+desktop.ini
+
+# ML experiment tracking (preemptive — currently unused, but tensorboard,
+# wandb, mlflow, lightning are easy to wire in later and they all write
+# large per-run directories that should never go to git)
+runs/
+mlruns/
+wandb/
+lightning_logs/
 
 # Logs
 logs/
 *.log
+
+# Temp files we sometimes create during doc edits
+_*_temp.md
+*.tmp
 
 # Calibration data — feature_history CSVs are too large for git.
 # Keep regenerated artifacts (weights, threshold JSON, sweep CSVs) out of

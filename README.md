@@ -192,6 +192,32 @@ expected. Per-symbol calibration is the operational answer; the
 cross-symbol number quantifies how much of the shock signature is
 microstructure-universal vs ticker-specific.
 
+## Datasets and empirical findings
+
+Quick inventory of what's been harvested through `fetch_history_alpaca.py`
+and what the model can and can't train on. Full discussion — including
+the two distinct "loss not improving" failure modes, observed positive-
+class density thresholds, per-symbol training results, cross-symbol
+generalization tables, and IEX-feed sparsity by symbol — lives in
+[`LAYER2_TRAINING.md`](LAYER2_TRAINING.md).
+
+| Symbol | Source | Sessions | Rows | Pos rate after H=30 | Trainable directly? |
+|---|---|---|---|---|---|
+| NVDA balanced | curated subset of Alpaca IEX | – | 384,354 | 4.43% | yes |
+| TSLA raw | Alpaca IEX | 73 | 46,973,402 | 0.98% | yes |
+| PLTR raw | Alpaca IEX | ~14 | 9,365,123 | ~0.045% | no — held-out eval only |
+| SPY raw | Alpaca IEX | 46 | 119,030,669 | ~0.015% | no — class collapse |
+| BTC/USD, SOL/USD | Coinbase Advanced (legacy) | – | <250K each | – | regression-test only |
+
+Empirical observation: this architecture trains cleanly above ~1%
+positive-class density and class-collapses below ~0.02%. SPY on the
+free-tier IEX feed sits in the dead zone because IEX captures only a
+small fraction of SPY's flow (which is dominated by NYSE Arca + dark
+ETF arbitrage venues); IEX is *not* sparsity-limited for actively-
+traded single names like NVDA and TSLA. Implication for symbol
+selection on this feed: prioritize venue overlap with IEX over
+absolute notional volume.
+
 ## File layout
 
 ```
@@ -216,6 +242,7 @@ disruption_arbitrage_engine/
 ├── requirements.txt
 ├── README.md                 # this file
 ├── IMPLEMENTATION.md         # full architectural rationale and runbooks
+├── LAYER2_TRAINING.md        # TCN training research log: data, densities, results
 └── tests/
     ├── test_sensors.py
     ├── test_calibration.py

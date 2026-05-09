@@ -1,0 +1,13 @@
+{
+  "threshold": 0.5,
+  "precision": 0.3285530295638599,
+  "recall": 0.7322405559856306,
+  "f1": 0.4535846677730124,
+  "criterion": "fbeta",
+  "beta": 2.0,
+  "sweep_source": "train",
+  "sweep_csv_path": "./calibration/feature_history_TSLA_balanced.csv",
+  "sweep_n_predictions": 46973342,
+  "sweep_n_positives": 459868,
+  "fallback": false
+}
