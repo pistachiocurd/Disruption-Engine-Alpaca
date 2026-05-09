@@ -58,6 +58,11 @@ EXCHANGE_SECRET = os.environ.get("EXCHANGE_SECRET", "")
 # real order flow. Any other value (including unset) keeps the system in testnet.
 EXCHANGE_LIVE = os.environ.get("EXCHANGE_LIVE", "false").lower() == "true"
 
+# Replay mode. Empty (default) → live exchange feed. Non-empty path → engine
+# uses ReplaySensorArray (test_replay.py) to drive Layers 2/3/4 + dashboard
+# from a feature_history CSV. Single-variable swap: unset to return to live.
+REPLAY_CSV = os.environ.get("REPLAY_CSV", "")
+
 # ============================================================================
 # Runtime Mode Flags
 # ============================================================================
@@ -225,7 +230,28 @@ SHADOW_PARALLEL_ENVS = 8
 # ============================================================================
 # Risk & Constraints
 # ============================================================================
-MAX_SESSION_DRAWDOWN_PCT = 0.02        # 2% session drawdown halts trading
+# Drawdown circuit-breaker: hybrid USD + percentage gate.
+#
+# The percentage gate alone — drawdown / peak_pnl — has unbounded leverage
+# when peak_pnl is small. A $1 winner followed by a $10 loss is a 1000%
+# drawdown ratio and trips any reasonable percent threshold instantly. So:
+#
+#   1. MAX_SESSION_DRAWDOWN_USD: absolute dollar cap, always active.
+#      Trips when (peak - current) > USD limit, regardless of peak size.
+#      This is the primary safety stop.
+#
+#   2. MAX_SESSION_DRAWDOWN_PCT: percentage cap, active only once peak >=
+#      DRAWDOWN_PCT_MIN_PEAK_USD. Below that floor the ratio is pathological
+#      and we rely on the USD cap.
+MAX_SESSION_DRAWDOWN_USD = float(
+    os.environ.get("MAX_SESSION_DRAWDOWN_USD", "1000.0")
+)
+MAX_SESSION_DRAWDOWN_PCT = float(
+    os.environ.get("MAX_SESSION_DRAWDOWN_PCT", "0.02")
+)
+DRAWDOWN_PCT_MIN_PEAK_USD = float(
+    os.environ.get("DRAWDOWN_PCT_MIN_PEAK_USD", "100.0")
+)
 KILL_SWITCH_LOG_PATH = "./logs/kill_switch.log"
 
 # ============================================================================

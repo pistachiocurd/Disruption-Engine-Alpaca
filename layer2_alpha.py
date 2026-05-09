@@ -310,8 +310,11 @@ class AlphaEngine:
         self.decision_log.append(rec)
 
     def _push_features(self, physics_state) -> None:
+        # ce_ratio scaled to match train_stream.py:101-105 preprocessing — without
+        # this, weights trained on ce_ratio/10 see 10× larger inputs at inference
+        # and the sigmoid output collapses to ~0.
         feats = np.array([
-            physics_state.ce_ratio,
+            physics_state.ce_ratio / 10.0,
             physics_state.obi,
             physics_state.liquidation_rate,
         ], dtype=np.float32)

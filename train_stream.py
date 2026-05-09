@@ -98,6 +98,8 @@ class StreamingTCNDataset(IterableDataset):
 
             # ce_ratio is divided by 10 to bring its dynamic range into
             # rough parity with obi (∈ [-1, 1]) and liquidation_rate.
+            # AlphaEngine._push_features applies the same /10 at inference,
+            # so trained weights and live inputs share scale.
             features = np.stack([
                 data_chunk["ce_ratio"] / 10,
                 data_chunk["obi"],

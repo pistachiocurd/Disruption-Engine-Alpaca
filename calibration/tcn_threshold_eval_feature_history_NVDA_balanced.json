@@ -1,0 +1,13 @@
+{
+  "threshold": 0.7,
+  "precision": 0.596405977812414,
+  "recall": 0.7647093399165344,
+  "f1": 0.6701522136657482,
+  "criterion": "fbeta",
+  "beta": 2.0,
+  "sweep_source": "val",
+  "sweep_csv_path": "calibration/feature_history_NVDA_balanced.csv",
+  "sweep_n_predictions": 384294,
+  "sweep_n_positives": 17013,
+  "fallback": false
+}

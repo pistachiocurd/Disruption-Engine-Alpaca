@@ -203,8 +203,11 @@ class Engine:
         self.exchange = self._init_exchange()
         self.shadow_mode = config.SHADOW_MODE
         # SessionManager only meaningful for equities; crypto runs 24/7.
+        # Skipped in REPLAY mode (no live calendar API call, no market-hours gate).
         self.session: Optional[SessionManager] = (
-            SessionManager(self.trading) if config.IS_EQUITY else None
+            SessionManager(self.trading)
+            if config.IS_EQUITY and not config.REPLAY_CSV
+            else None
         )
 
         # Optional preloaded calibration (μ, Σ for OOD; α_calibration_c for solver).
@@ -237,15 +240,24 @@ class Engine:
             feature_dumper = FeatureDumper(dump_path)
             log.info("FeatureDumper writing to %s", dump_path)
 
-        self.sensors = SensorArray(
-            exchange=self.exchange,
-            symbol=config.SYMBOL,
-            liquidation_tracker=liquidation,
-            ood_detector=ood,
-            hmm=StudentTHMM.from_default_priors(),
-            alpha_calibration_c=alpha_c,
-            feature_dumper=feature_dumper,
-        )
+        if config.REPLAY_CSV:
+            from test_replay import ReplaySensorArray
+            self.sensors = ReplaySensorArray(
+                csv_path=config.REPLAY_CSV,
+                symbol=config.SYMBOL,
+                alpha_calibration_c=alpha_c,
+            )
+            log.info("ReplaySensorArray active; reading from %s", config.REPLAY_CSV)
+        else:
+            self.sensors = SensorArray(
+                exchange=self.exchange,
+                symbol=config.SYMBOL,
+                liquidation_tracker=liquidation,
+                ood_detector=ood,
+                hmm=StudentTHMM.from_default_priors(),
+                alpha_calibration_c=alpha_c,
+                feature_dumper=feature_dumper,
+            )
         # Initial turbulence threshold from config; train_tcn.py's sidecar
         # JSON, if present, overrides this with a value derived from the
         # validation PR curve.
@@ -329,6 +341,9 @@ class Engine:
 
     # ---------------------------------------------------- exchange wiring
     def _init_exchange(self):
+        if config.REPLAY_CSV:
+            log.info("REPLAY_CSV set (%s); skipping exchange init.", config.REPLAY_CSV)
+            return None
         if config.IS_EQUITY:
             return self._init_alpaca()
         return self._init_ccxt()
@@ -338,6 +353,7 @@ class Engine:
             from alpaca.data.live import StockDataStream
             from alpaca.data.historical import StockHistoricalDataClient
             from alpaca.trading.client import TradingClient
+            from alpaca.data.enums import DataFeed
         except ImportError as e:
             raise ImportError(
                 "alpaca-py is required for equities. install via `pip install alpaca-py`"
@@ -351,7 +367,10 @@ class Engine:
                 "auth on first request — set them before going live."
             )
 
-        feed = config.ALPACA_DATA_FEED
+        # Current alpaca-py requires DataFeed enum, not a string — passing the
+        # raw "iex"/"sip" string passes the equality check inside StockDataStream
+        # but then crashes on feed.value when constructing the websocket URL.
+        feed = DataFeed(config.ALPACA_DATA_FEED.lower())
         data_stream = StockDataStream(key, secret, feed=feed)
         self.hist = StockHistoricalDataClient(key, secret)
         # `paper=True` when EXCHANGE_LIVE is not literally "true". Mirrors the
@@ -630,10 +649,20 @@ class Engine:
         self.session_peak_pnl = max(self.session_peak_pnl, self.session_pnl)
 
     def _max_drawdown_breached(self) -> bool:
-        if self.session_peak_pnl <= 0:
+        drawdown_usd = self.session_peak_pnl - self.session_pnl
+        if drawdown_usd <= 0:
             return False
-        drawdown = (self.session_peak_pnl - self.session_pnl) / self.session_peak_pnl
-        return drawdown > config.MAX_SESSION_DRAWDOWN_PCT
+        # Absolute-dollar cap is always active; this is the primary safety
+        # stop and is robust to tiny session_peak_pnl values that make the
+        # percentage formula explode.
+        if drawdown_usd > config.MAX_SESSION_DRAWDOWN_USD:
+            return True
+        # Percentage cap activates only once the peak is meaningful enough
+        # that drawdown/peak isn't pathological — otherwise a $0.91 peak +
+        # $9 loss = 1000% "drawdown" trips a 2% gate after three episodes.
+        if self.session_peak_pnl < config.DRAWDOWN_PCT_MIN_PEAK_USD:
+            return False
+        return (drawdown_usd / self.session_peak_pnl) > config.MAX_SESSION_DRAWDOWN_PCT
 
     async def _cancel_all_open_orders(self) -> None:
         try:
