@@ -1,0 +1,31 @@
+# Python artifacts
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Logs
+logs/
+*.log
+
+# Calibration data — feature_history CSVs are too large for git.
+# Keep regenerated artifacts (weights, threshold JSON, sweep CSVs) out of
+# the ignore list so the trained model and its operating point are
+# committed alongside the code that produced them.
+calibration/feature_history_*.csv
+calibration/synthetic_history.csv
+calibration/shock_validation.csv
