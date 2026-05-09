@@ -23,6 +23,7 @@ _PAIR_DEFAULTS = {
     # PPO action space discretizes on integer shares.
     "NVDA":     {"tick": 0.01,    "min_order": 1.0,    "max_position": 200.0},
     "SPY":      {"tick": 0.01,    "min_order": 1.0,    "max_position": 500.0},
+    "TSLA":     {"tick": 0.01,    "min_order": 1.0,    "max_position": 100.0},
     # Crypto pairs retained for back-compat / regression tests.
     "BTC/USD":  {"tick": 0.01,    "min_order": 0.001,  "max_position": 0.5},
     "ETH/USD":  {"tick": 0.01,    "min_order": 0.01,   "max_position": 5.0},
