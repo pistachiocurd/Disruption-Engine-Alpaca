@@ -1,10 +1,73 @@
 # Disruption Arbitrage Engine
 
+> **Status**: Private research prototype, shared with a small invited
+> audience. Layer 1–2 trained and calibrated; Layer 3 (PPO execution)
+> untrained and the open frontier of the project. **Not production-ready** —
+> `_live_submit` is a stub by design; the engine runs in shadow mode against
+> simulated fills.
+
+![Engine running in shadow mode against TSLA replay](docs/screenshots/dashboard_running.png)
+
 Physics-informed market-making / shock-arbitrage engine. Detects pre-shock
 microstructure signatures, computes a post-shock equilibrium price via
 attrition-adjusted heat-equation diffusion, and executes the resulting
 mandate through a fee-aware PPO agent that is continuously retrained in
 the background.
+
+## Architecture at a glance
+
+```mermaid
+flowchart TD
+    subgraph L1["Layer 1 — Sensors (per WS event)"]
+        VPIN["VPIN<br/>(Lee-Ready)"]
+        KALMAN["Student-t<br/>Kalman"]
+        HMM["Student-t HMM"]
+        OOD["OODDetector<br/>(Mahalanobis)"]
+        CE["CE / Quote-cancel<br/>proxy"]
+    end
+
+    subgraph L2["Layer 2 — Alpha (50ms tick)"]
+        TCN["TCN spike predictor<br/>turbulence ∈ (0,1)"]
+        SOLVER["Heat-equation solver<br/>P_eq + sensitivity guard"]
+        GATES2["Gates: OOD · turbulence ·<br/>attrition uncertainty · MIN_ORDER_SIZE"]
+    end
+
+    subgraph L3["Layer 3 — Execution"]
+        ENV["ExecutionEnv<br/>(42-dim, side-symmetric)"]
+        PPO["PPOAgent<br/>action ∈ [-1,1]"]
+        MATCH["LocalMatchingEngine<br/>(SHADOW_MODE)"]
+    end
+
+    subgraph L4["Layer 4 — Shadow Trainer (GPU, async)"]
+        REPLAY["ReplayBuffer<br/>(24h ring)"]
+        TRAINER["PPOTrainer<br/>+ StabilityGate (KL · regime · 50K-step)"]
+        POLYAK["Polyak τ=0.05"]
+    end
+
+    subgraph RISK["Engine-level risk gates"]
+        POS["Aggregate position limit"]
+        DDIS["IS drawdown ($1K / 2%)"]
+        DDMTM["MTM drawdown ($20K / 10%)"]
+        DRIFT["Drift monitor"]
+        SESSION["Session reset on market open"]
+    end
+
+    L1 --> L2
+    L2 -- "TradeMandate" --> L3
+    L3 -- "ReplayEntry" --> L4
+    L4 -. "Polyak push" .-> PPO
+    L3 -. "fills, PnL" .-> RISK
+    RISK -. "kill / suppress" .-> L3
+    SESSION -. "every market open" .-> L1
+
+    classDef layer fill:#1a1a1a,stroke:#888,color:#eee
+    classDef risk fill:#2a1a1a,stroke:#a55,color:#eee
+    class L1,L2,L3,L4 layer
+    class RISK risk
+```
+
+(Full topology with WebSocket sources, calibration loops, and per-task
+asyncio cadences in [IMPLEMENTATION.md §1](IMPLEMENTATION.md).)
 
 **Primary target: US equities via Alpaca** (NVDA by default; SPY also
 supported). The original crypto path (Coinbase Advanced spot, optional
@@ -350,3 +413,48 @@ co-locate in the same file.
 4. HPO winning trial validated on the SUBSEQUENT week.
 
 Only then flip `SHADOW_MODE=False` and `EXCHANGE_LIVE=true`.
+
+## Open work / collaboration
+
+Three concrete pieces that someone clone-and-explore could pick up:
+
+### 1. Layer 3 PPO is the open frontier
+
+The execution agent (`layer3_execution.py`) is structurally complete — full
+`ExecutionEnv`, `PPOAgent` with split CNN encoders, `PPOTrainer` with GAE,
+clipped surrogate, and entropy regularization — but it is **random-init at
+every session start**. Layer 4's `ShadowSimulator` collects replay data and
+trains a shadow agent online; promotion to the live agent is gated on a
+three-condition stability check (KL < 0.1, regime match, ≥ 50K steps), then
+Polyak-averaged with τ=0.05. In practice no single session accumulates
+enough data for the gate to fire.
+
+Specific open problem: a saved-and-loadable PPO checkpoint flow that
+respects the regime-match assumption. Naive load-on-boot would push
+yesterday-trained-on-Turbulent weights into a Laminar morning. The right
+abstraction is regime-keyed checkpoints (load the weights matching today's
+opening regime), but that requires a regime-classification step before the
+TCN buffer warms up. Open design question.
+
+### 2. Eval harness needs hooking
+
+`hpo.py` defines the Optuna study over `(η, γ_inv, terminal_mult)` with
+holdout validation, but the data-provider callables
+(`train_data_provider`, `eval_data_provider`, `holdout_data_provider`) are
+stubs (see `IMPLEMENTATION.md §9`). Producing a real archived-mandate
+replay stream is a one-time write specific to whoever has the data lake —
+not hard, just unwritten.
+
+### 3. Replay session-boundary detection
+
+`test_replay.ReplaySensorArray` doesn't notice when the harvested CSV
+stitches across trading days; mid can jump 40%+ at a session join. Today
+this is worked around by loosening the MTM drawdown caps in replay mode.
+A timestamp-gap detector that triggers `_reset_session_risk_state` would
+let the production caps work in replay too — small change, fully isolated
+to `test_replay.py`.
+
+These are described more deeply in [LAYER2_TRAINING.md §11](LAYER2_TRAINING.md);
+that document is also the source of truth for what's been calibrated, what
+the cross-symbol generalization looks like, and what claims this project
+will and will not make.
