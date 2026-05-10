@@ -241,7 +241,7 @@ class Engine:
             log.info("FeatureDumper writing to %s", dump_path)
 
         if config.REPLAY_CSV:
-            from test_replay import ReplaySensorArray
+            from tests.test_replay import ReplaySensorArray
             self.sensors = ReplaySensorArray(
                 csv_path=config.REPLAY_CSV,
                 symbol=config.SYMBOL,
