@@ -24,6 +24,12 @@ alpaca-py>=0.13
 ccxt>=4.3                 # ccxt.pro is bundled in recent versions; coinbaseadvanced supported
 websockets>=12.0          # raw connection used by the (Binance-only) forceOrder liquidation stream
 
+# Hyperliquid historical harvester (fetch_history_hyperliquid.py).
+# Both buckets are Requester Pays — boto3 must include RequestPayer="requester"
+# on every call. lz4 decompresses the JSONL files in the archive.
+boto3>=1.34
+lz4>=4.3
+
 # Hyperparameter optimization
 optuna>=3.5
 

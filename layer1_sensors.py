@@ -416,6 +416,15 @@ class LiquidationCascadeTracker:
         while self._events and self._events[0][0] < cutoff:
             self._events.popleft()
 
+    def record(self, ts_ms: int, qty: float) -> None:
+        """Public injection hook for adapters that source liquidations from
+        a non-Binance feed (e.g. parsed out of HL trade events during
+        harvest replay). The Binance WS path uses _record directly; this
+        wraps it so external callers don't reach into a private method."""
+        if not self.enabled:
+            return
+        self._record(ts_ms, qty)
+
     def liquidation_rate(self, normalizer_volume: float) -> float:
         """
         Total liquidated qty in the window divided by `normalizer_volume`
@@ -428,12 +437,26 @@ class LiquidationCascadeTracker:
         return total / normalizer_volume
 
     async def run(self) -> None:
-        """Outer reconnection loop. Subscribes to the raw Binance WS feed."""
+        """Outer reconnection loop. Subscribes to the raw Binance WS feed.
+
+        For non-Binance venues (e.g. Hyperliquid), the tracker is enabled
+        but events come via `record()` from a venue-specific adapter
+        rather than from this WS loop. We early-return so we don't try
+        to connect to the Binance URL on a non-Binance run.
+        """
         if not self.enabled:
-            log.info("LiquidationCascadeTracker disabled (non-Binance exchange).")
+            log.info("LiquidationCascadeTracker disabled.")
+            return
+        from config import EXCHANGE_ID
+        if EXCHANGE_ID != "binance":
+            log.info(
+                "LiquidationCascadeTracker enabled but no live WS source for "
+                "EXCHANGE_ID=%s; events arrive via record() from a venue adapter "
+                "(e.g. HL harvester).", EXCHANGE_ID,
+            )
             return
         try:
-            import websockets  # local import — only needed when enabled
+            import websockets  # local import — only needed for Binance live
         except ImportError:
             log.error("websockets package not installed — liquidation tracker disabled.")
             self.enabled = False
@@ -758,9 +781,12 @@ class SensorArray:
 
         from config import EXCHANGE_ID
         is_binance = (EXCHANGE_ID == "binance")
-        # Equities have no liquidation feed; the tracker emits 0.0 when disabled
-        # and the engine never spawns its WS reconnect loop.
-        liq_enabled = is_binance and not IS_EQUITY
+        is_hyperliquid = (EXCHANGE_ID == "hyperliquid")
+        # Equities have no liquidation feed; non-Binance crypto venues feed
+        # the tracker via record() from venue-specific adapters (e.g. HL
+        # harvester parses liquidations out of trade events). Tracker stays
+        # enabled in those cases so the rate isn't pinned to 0.
+        liq_enabled = (is_binance or is_hyperliquid) and not IS_EQUITY
         self.liquidation = liquidation_tracker or LiquidationCascadeTracker(
             symbol=symbol, enabled=liq_enabled
         )

@@ -39,11 +39,83 @@ import numpy as np
 import polars as pl
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import IterableDataset, DataLoader
 
 import config
 from layer2_alpha import TCNSpikePredictor
 from train_tcn import build_labels
+
+
+class MultiCsvTCNDataset(IterableDataset):
+    """Concatenates multiple StreamingTCNDataset instances for multi-coin
+    training. Each per-coin CSV is processed independently — its own
+    sliding-window labels, its own carry-over across chunk boundaries —
+    so coin transitions don't introduce a cross-symbol price discontinuity
+    in the windowed features. Yields (X, y) pairs in coin-by-coin order.
+
+    Use multi-coin training only when the per-coin shock counts are
+    individually thin. The implicit assumption is that pre-shock
+    microstructure signatures are coin-agnostic enough that aggregating
+    across coins gives the model more positives without adding noise.
+    The cross-symbol matrix in §7 of LAYER2_TRAINING.md (TSLA->NVDA F1
+    near in-domain) is the empirical justification for that assumption
+    — but it was measured on equity-IEX data; verify on crypto perps.
+    """
+
+    def __init__(self, csv_paths: list, seq_len: int = 60,
+                 label_source: str = "regime", label_horizon=None):
+        self.datasets = [
+            StreamingTCNDataset(p, seq_len=seq_len,
+                                label_source=label_source,
+                                label_horizon=label_horizon)
+            for p in csv_paths
+        ]
+
+    def __iter__(self):
+        for ds in self.datasets:
+            yield from ds
+
+
+class FocalLossWithLogits(nn.Module):
+    """Binary focal loss with logits. Lin et al. 2017 (RetinaNet paper).
+
+        FL(p_t) = -α_t (1 - p_t)^γ log(p_t)
+
+    where p_t = p if y=1 else (1-p), and α_t = α if y=1 else (1-α).
+
+    γ (focusing): down-weights easy examples. γ=0 reduces to weighted BCE.
+        γ=2 is the canonical RetinaNet value.
+    α (balancing): weights positive class. α=0.25 weights negatives 3:1
+        (counterintuitive but counters the modulating factor's bias toward
+        the rare class). For sparse positives in market microstructure,
+        α=0.5–0.75 often works better — tune empirically.
+
+    Replaces BCEWithLogitsLoss(pos_weight=...) when the rare-class learning
+    bottleneck (§5 lesson 6 of LAYER2_TRAINING.md) makes pos_weight scaling
+    unstable — losses spike on positive-heavy batches and gradients flip
+    between "predict everything" and "predict nothing". Focal loss is more
+    stable because it scales gradients by per-sample confidence rather
+    than uniformly per-class.
+    """
+
+    def __init__(self, gamma: float = 2.0, alpha: float = 0.25):
+        super().__init__()
+        self.gamma = gamma
+        self.alpha = alpha
+
+    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        targets = targets.to(logits.dtype)
+        ce = F.binary_cross_entropy_with_logits(logits, targets, reduction="none")
+        # p_t = sigmoid(logit) for positives, (1 - sigmoid(logit)) for negatives
+        p = torch.sigmoid(logits)
+        p_t = p * targets + (1.0 - p) * (1.0 - targets)
+        focal_factor = (1.0 - p_t) ** self.gamma
+        loss = focal_factor * ce
+        if self.alpha >= 0:
+            alpha_t = self.alpha * targets + (1.0 - self.alpha) * (1.0 - targets)
+            loss = alpha_t * loss
+        return loss.mean()
 
 
 class StreamingTCNDataset(IterableDataset):
@@ -58,9 +130,23 @@ class StreamingTCNDataset(IterableDataset):
     drop seq_len-1 windows at every boundary.
     """
 
-    def __init__(self, csv_path, seq_len=60):
+    def __init__(self, csv_path, seq_len=60, label_source="regime", label_horizon=None):
+        """label_source: 'regime' (default — uses regime==1 transitions) or
+        'shock' (uses identify_shock_events from calibration.py — price+VPIN
+        based, doesn't depend on HMM calibration). Use 'shock' on harvests
+        where the HMM is cold-start; use 'regime' once HMM emissions are
+        fitted offline.
+
+        label_horizon: number of ticks before each shock to mark positive.
+        None (default) = use config.TCN_LABEL_HORIZON_TICKS. Override when
+        tests/test_features.py shows signal concentrated in fewer ticks.
+        """
         self.csv_path = csv_path
         self.seq_len = seq_len
+        if label_source not in ("regime", "shock"):
+            raise ValueError(f"label_source must be 'regime' or 'shock', got {label_source!r}")
+        self.label_source = label_source
+        self.label_horizon = label_horizon
 
     def __iter__(self):
         reader = pl.read_csv_batched(self.csv_path)
@@ -78,9 +164,10 @@ class StreamingTCNDataset(IterableDataset):
             # on the shock itself when it's already too late to act.
             n = len(df_chunk)
             labels = np.zeros(n, dtype=np.float32)
-            horizon = config.TCN_LABEL_HORIZON_TICKS
+            horizon = self.label_horizon if self.label_horizon is not None else config.TCN_LABEL_HORIZON_TICKS
 
-            if "regime" in data_chunk:
+            use_regime = (self.label_source == "regime") and ("regime" in data_chunk)
+            if use_regime:
                 regime = data_chunk["regime"].astype(np.int8)
                 is_start = np.zeros(n, dtype=bool)
                 if n > 0:
@@ -247,6 +334,15 @@ def _format_metrics(label, avg_loss, tp, fp, fn, n_pos_true, n_pos_pred, n_total
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument(
+        "--csv",
+        default=None,
+        help=f"Training CSV path(s). Single path or comma-separated list "
+             f"for multi-coin training (each coin's CSV is iterated "
+             f"independently — see MultiCsvTCNDataset). "
+             f"Default: config.FEATURE_DUMP_PATH "
+             f"({config.FEATURE_DUMP_PATH})",
+    )
+    parser.add_argument(
         "--val-csv",
         default=None,
         help="Optional held-out CSV for per-epoch validation. "
@@ -273,12 +369,79 @@ def main():
         help="Skip training; load existing weights and just run the threshold sweep. "
              "Lets you re-pick the operating point without retraining.",
     )
+    parser.add_argument(
+        "--label-source",
+        choices=["regime", "shock"],
+        default="regime",
+        help="Source of positive labels. 'regime' uses regime==1 transitions "
+             "(default; matches docs; requires fitted HMM emissions). 'shock' "
+             "uses identify_shock_events (price+VPIN; HMM-independent — use "
+             "this when the HMM is cold-start, e.g. on a freshly harvested "
+             "venue without offline calibration).",
+    )
+    parser.add_argument(
+        "--loss",
+        choices=["bce", "focal"],
+        default="bce",
+        help="Loss function. 'bce' is BCEWithLogitsLoss(pos_weight=10) "
+             "(default; matches existing TSLA training). 'focal' is binary "
+             "focal loss (Lin et al. 2017) — use this when training is "
+             "unstable from the rare-class learning bottleneck (loss spikes "
+             "on positive-heavy batches, model collapses to 'predict "
+             "nothing'). See §11.4 of LAYER2_TRAINING.md for context.",
+    )
+    parser.add_argument(
+        "--focal-gamma",
+        type=float,
+        default=2.0,
+        help="γ (focusing) for --loss=focal. γ=0 is weighted BCE; γ=2 is "
+             "RetinaNet default. Higher γ = more aggressive down-weighting "
+             "of easy examples.",
+    )
+    parser.add_argument(
+        "--focal-alpha",
+        type=float,
+        default=0.5,
+        help="α (positive-class weight) for --loss=focal. α=0.25 is "
+             "RetinaNet default (counterintuitively biased toward "
+             "negatives; the modulating factor already favors hard "
+             "positives). For sparse market microstructure positives, "
+             "α=0.5–0.75 often works better. Tune empirically.",
+    )
+    parser.add_argument(
+        "--label-horizon",
+        type=int,
+        default=None,
+        help="Override config.TCN_LABEL_HORIZON_TICKS (default 30). The "
+             "H ticks before each shock are marked positive. Shorter H = "
+             "tighter signal-to-label match (use when tests/test_features.py "
+             "shows signal concentrated in last ~10 ticks). Longer H = "
+             "more positive labels but more label-noise from windows "
+             "where the actual signature isn't yet visible.",
+    )
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Initializing Neural Network on: {device}")
 
-    dataset = StreamingTCNDataset(config.FEATURE_DUMP_PATH, seq_len=60)
+    train_csv_arg = args.csv or config.FEATURE_DUMP_PATH
+    csv_paths = [p.strip() for p in str(train_csv_arg).split(",") if p.strip()]
+    horizon_used = args.label_horizon if args.label_horizon is not None else config.TCN_LABEL_HORIZON_TICKS
+    if len(csv_paths) == 1:
+        train_csv = csv_paths[0]
+        print(f"Training CSV: {train_csv}")
+        dataset = StreamingTCNDataset(
+            train_csv, seq_len=60,
+            label_source=args.label_source, label_horizon=args.label_horizon,
+        )
+    else:
+        train_csv = csv_paths  # list, used for sweep below
+        print(f"Training CSVs ({len(csv_paths)}, multi-coin): {csv_paths}")
+        dataset = MultiCsvTCNDataset(
+            csv_paths, seq_len=60,
+            label_source=args.label_source, label_horizon=args.label_horizon,
+        )
+    print(f"Label source: {args.label_source}, horizon: {horizon_used} ticks")
     train_loader = DataLoader(
         dataset,
         batch_size=args.batch_size,
@@ -289,7 +452,10 @@ def main():
 
     val_loader = None
     if args.val_csv:
-        val_dataset = StreamingTCNDataset(args.val_csv, seq_len=60)
+        val_dataset = StreamingTCNDataset(
+            args.val_csv, seq_len=60,
+            label_source=args.label_source, label_horizon=args.label_horizon,
+        )
         # num_workers=0 on val: IterableDataset doesn't shard by worker_info,
         # so num_workers>0 would yield each sample twice and inflate counts.
         val_loader = DataLoader(
@@ -304,11 +470,21 @@ def main():
 
     model = TCNSpikePredictor().to(device)
 
-    # pos_weight=10 nudges gradients toward catching shocks even though the
-    # base class balance is closer to 4% positive on the curated CSV. Dial
-    # down to ~3 if precision matters more than recall.
+    # Loss function: BCE+pos_weight is the historical default; focal is the
+    # documented next step (§11.4 of LAYER2_TRAINING.md) when the rare-class
+    # learning bottleneck makes BCE unstable. See --loss flag help.
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
-    criterion = nn.BCEWithLogitsLoss(pos_weight=torch.tensor([10.0]).to(device))
+    if args.loss == "focal":
+        criterion = FocalLossWithLogits(
+            gamma=args.focal_gamma, alpha=args.focal_alpha,
+        ).to(device)
+        print(f"Loss: focal (gamma={args.focal_gamma}, alpha={args.focal_alpha})")
+    else:
+        # pos_weight=10 nudges gradients toward catching shocks even though
+        # the base class balance is closer to 4% positive on the curated
+        # CSV. Dial down to ~3 if precision matters more than recall.
+        criterion = nn.BCEWithLogitsLoss(pos_weight=torch.tensor([10.0]).to(device))
+        print("Loss: BCE with pos_weight=10")
 
     scaler = torch.amp.GradScaler('cuda')
 
@@ -403,13 +579,23 @@ def main():
         sweep_source = "val"
         sweep_path = args.val_csv
     else:
-        sweep_dataset = StreamingTCNDataset(config.FEATURE_DUMP_PATH, seq_len=60)
+        if isinstance(train_csv, list):
+            sweep_dataset = MultiCsvTCNDataset(
+                train_csv, seq_len=60,
+                label_source=args.label_source, label_horizon=args.label_horizon,
+            )
+            sweep_path = ",".join(train_csv)
+        else:
+            sweep_dataset = StreamingTCNDataset(
+                train_csv, seq_len=60,
+                label_source=args.label_source, label_horizon=args.label_horizon,
+            )
+            sweep_path = train_csv
         sweep_loader = DataLoader(
             sweep_dataset, batch_size=args.batch_size,
             pin_memory=True, num_workers=0,
         )
         sweep_source = "train"
-        sweep_path = config.FEATURE_DUMP_PATH
 
     print(f"\n=== Threshold sweep ({sweep_source}: {sweep_path}) ===")
     probs, labels = collect_predictions(model, sweep_loader, device)

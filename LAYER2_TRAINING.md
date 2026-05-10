@@ -653,3 +653,196 @@ python -u engine.py 2>&1 | Tee-Object -FilePath engine_smoke_TSLA_monday.log
 `REPLAY_CSV` unset → live Alpaca path, tight MTM caps ($20K USD,
 10 % peak-relative), `latest_TSLA.json` auto-loads, position cap at
 100 shares, all gates active. Session reset fires on market open.
+
+## 12. Feature predictability diagnostic (`tests/test_features.py`)
+
+Added 2026-05-10 during the Hyperliquid harvest prove-out. Quickly answers
+"is the signal even in the data?" before spending hours on label/loss/
+data-volume tuning. Computes 2-sample Kolmogorov-Smirnov distance between
+pre-shock windows and random non-shock windows, per channel, on both the
+full 60-tick window and the trailing 10 ticks (where leading-classifier
+signal should concentrate).
+
+```powershell
+python tests/test_features.py --csv calibration/feature_history_<COIN>.csv
+```
+
+**Reading the output:** KS D > 0.10 with p < 1e-10 on at least one
+channel = signal is genuinely there; if training fails, suspect labels /
+loss / data volume. KS D < 0.05 with non-significant p across all
+channels = no signal in this feature set; no NN architecture can extract
+what isn't statistically present.
+
+**HL BTC perp findings (3 days, 210 shocks, 2026-05-10):**
+
+| channel | full window KS D | last-10-tick KS D | reading |
+|---|---|---|---|
+| ce_ratio/10 | 0.021 (p=8e-5) | 0.027 (p=0.13) | weak signal, not significant in last 10 |
+| **obi** | **0.061 (p=2e-37)** | **0.130 (p=3e-28)** | strong, temporally concentrated |
+| liquidation_rate | dead channel | dead channel | HL liq adapter not yet wired |
+
+OBI carries the bulk of HL's pre-shock signal and concentrates in the
+**last ~10 ticks** before a shock. Implications: the H=30 label horizon
+used by `train_stream.py` dilutes this signal; training with H=10 should
+produce materially better F2. CE_ratio behaves differently on HL than
+TSLA — on TSLA the L1 quote-cancel proxy carried most of the signal; on
+HL the L2-derived CE doesn't carry HL's perp-shock signature in the
+last-tick window. This is expected: different microstructure regimes
+have different leading indicators.
+
+**Empirical correction (2026-05-10, after H=10 retry):** Tightening the
+horizon to 10 ticks made things *worse* (F2 0.027 → 0.010). The diagnostic
+correctly identified where signal lives but understated the role of
+absolute positive count. With 210 shocks × H=30 = 11,880 positives,
+focal+α=0.5 plateaus at "predict negative everywhere"; cutting to
+210 × 10 = 2,100 positives crashes harder. TSLA's reference is
+25,307 shocks × H=30 = 759K positive labels — 64× more than HL 3-day.
+The dominant constraint on HL is positive-label *count*, not density and
+not feature concentration. Combined fixes (multi-coin + liquidation
+channel + 14-21 day harvest) target this directly.
+
+## 13. Hyperliquid liquidation channel and multi-coin training (2026-05-10)
+
+Two infrastructure additions to address the HL TCN training plateau:
+
+### 13.1 HL liquidation channel — un-degenerating the OOD covariance
+
+`liquidation_rate` was identically 0 on HL in earlier runs because
+`LiquidationCascadeTracker` is conditioned on Binance's `!forceOrder`
+WS feed — non-Binance venues got `enabled=False`. This degraded the
+3-channel OOD detector to effectively 2D (`Σ_diag[2] = 0`, regularized
+by 1e-6 jitter, see §A row 5 of the research review) and gave the TCN
+one input channel that contributes nothing.
+
+**Source choice**: HL does not surface liquidations identifiably in the
+`node_fills_by_block` archive. Verified empirically (see
+[tests/inspect_hl_liquidations.py](tests/inspect_hl_liquidations.py)
+output, 2026-05-10): no `dir` value contains "Liquidate", 100% of
+`trade_dir_override` are missing/'Na', and no counterparty address
+dominates with a "liquidator vault" pattern. The labeled source is the
+official [`hyperliquid-dex/historical_data/liquidations.csv`](https://github.com/hyperliquid-dex/historical_data),
+schema `time,user,liquidated_ntl_pos,liquidated_account_value,leverage_type`.
+
+Note: the CSV has **no `coin` field** — events represent aggregate
+cross-market liquidation pressure in USD notional, not per-coin
+liquidations. Treated as a market-wide stress signal injected uniformly
+across per-coin harvests; per-coin VPIN normalization in
+`LiquidationCascadeTracker.liquidation_rate()` produces a per-coin
+scaling.
+
+Wiring:
+
+- `LiquidationCascadeTracker.record(ts_ms, qty)` — public injection hook
+  for adapters. The Binance WS path still uses `_record` directly.
+- `LiquidationCascadeTracker.run()` — early-returns for non-Binance
+  venues so we don't try to connect to the Binance URL on HL.
+- `SensorArray.__init__` — `liq_enabled = (is_binance or is_hyperliquid)
+  and not IS_EQUITY`. Tracker stays enabled on HL.
+- `fetch_history_hyperliquid.load_hl_liquidations()` — downloads (and
+  caches at `./calibration/hl_liquidations.csv`) the official CSV, parses
+  to `[(ts_ms, ntl_usd)]`. `--refresh-liquidations` forces re-download.
+- `fetch_history_hyperliquid.cmd_harvest()` — heap-merges three event
+  streams (L2 books, trades, liquidations from CSV) and dispatches to
+  `_process_order_book`, `_process_trade`, and `liquidation.record()`
+  respectively. Pass `--no-liquidations` to skip if you want the old
+  Σ_diag[2]=0 behavior for comparison.
+
+After wiring: `liquidation_rate > 0` in the harvested CSV, OOD
+covariance becomes full-rank, TCN sees three meaningful input channels.
+
+### 13.2 Multi-coin training
+
+For HL the per-coin shock count is the binding constraint on TCN
+training (210 BTC shocks/3 days vs TSLA's 25K equity-IEX). Aggregating
+across BTC + ETH + SOL multiplies the positive-label count without
+extending the harvest window — assumes the cross-symbol generalization
+finding from §7 (TSLA→NVDA F1=0.691 ≈ in-domain) extends from equities
+to crypto perps.
+
+- Harvester: `--coins BTC,ETH,SOL` runs the chronological replay once
+  per coin in its own `SensorArray` (correct per-coin VPIN/Kalman
+  state) and writes `feature_history_<COIN>.csv` per coin.
+- Trainer: `train_stream.py --csv path1.csv,path2.csv,path3.csv` uses
+  `MultiCsvTCNDataset`, which yields from each per-coin
+  `StreamingTCNDataset` independently — labels and carry-over are
+  per-coin so coin transitions don't introduce cross-symbol price
+  discontinuities in the windowed features.
+
+The cross-symbol-transfer assumption is the load-bearing piece. If
+multi-coin training degrades vs single-coin, that's evidence the
+crypto-perp microstructure is more coin-specific than equity microstructure
+and we should train per-coin and ensemble; if it improves, the
+universal-microstructure-features hypothesis holds on perps and we
+proceed with aggregate training.
+
+### 13.3 Multi-coin training — negative result (2026-05-10)
+
+Multi-coin pooling tested. **Multi-coin helped marginally but did not
+break through.** F2 climbed from 0.027 (3d BTC single-coin) to 0.046
+(7d × 3-coin) — directionally correct but still at noise-floor levels
+(base rate prec 0.024).
+
+Full experiment progression on HL perps, in order:
+
+| # | Config | Pos count | F2 | Threshold sweep shape |
+|---|---|---:|---:|---|
+| 1 | 1d BTC, regime, BCE | 1,720 | 0.205 | usable curve, density below floor |
+| 2 | 1d BTC, shock, BCE | 5,880 | 0.046 | degenerate (everything-positive then nothing) |
+| 3 | 3d BTC, shock, BCE | 11,880 | 0.028 | degenerate, unstable training |
+| 4 | 3d BTC, shock, focal α=0.5, H=30 | 11,880 | 0.027 | degenerate, stable training |
+| 5 | 3d BTC, shock, focal α=0.75, H=10 | 3,960 | 0.010 | degenerate, fewer positives hurt |
+| 6 | 7d × 3-coin, shock, focal α=0.5, H=30, ep=10 | 153,578 | 0.046 | degenerate, prec≈base rate at any usable thr |
+| 7 | 7d × 3-coin, shock, focal α=0.5, H=30, ep=1 | 153,578 | 0.046 | degenerate (overtraining isn't the issue) |
+
+**What's been ruled out:**
+
+- Cold-start HMM regime noise — switching to `--label-source shock`
+  (price+VPIN) fixed the labeling distribution but didn't move F2.
+- Label horizon too long — `--label-horizon 10` made it worse, not
+  better. Diagnostic correctly identified signal lives in last 10 ticks
+  but the absolute-positive-count constraint dominates.
+- BCE pos_weight=10 instability — `--loss focal --focal-alpha 0.5`
+  fixed per-batch spike instability; F2 unchanged.
+- Focal alpha tuning — α=0.5 and α=0.75 produced effectively identical F2.
+- Insufficient single-coin data — 3× more data on a single coin (1d→3d)
+  marginally hurt F2 not helped.
+- Single-coin training bottleneck — multi-coin 21 coin-days produced
+  similar F2 to single-coin 3 days.
+- Overtraining collapse — `--epochs 1` produced the same threshold-sweep
+  shape as `--epochs 10`. Model never extracts signal at any epoch.
+
+**What's confirmed:**
+
+- Data injection is correct (channel order, scale, time direction
+  match between train and serve; verified by reading both paths).
+- Signal IS in the data — `tests/test_features.py` measures KS D=0.13
+  on OBI in the last 10 ticks before shock, p ≈ 1e-28. Statistically
+  robust discriminative signal.
+- Architecture fits — loss decreases monotonically every run; per-batch
+  losses stable under focal.
+- Model never genuinely discriminates — every threshold sweep produces
+  the same pathology: predicts all-positive below thr=0.15, prec≈base
+  rate at thr=0.20, predicts nothing above thr=0.25.
+
+**Working hypotheses for why the TCN doesn't extract HL's signal:**
+
+1. **Absolute positive count is still too low.** TSLA reference is
+   759K positive labels (25K shocks × 73 sessions × H=30); we're at
+   154K (2.8K shocks × 7d × 3c × H=30). 5× short. May need 30+ coin-days.
+2. **Architecture is wrong for HL microstructure.** TCN is causal 1D conv;
+   maybe transformer/state-space (Mamba) handles ms-irregular HL cadence
+   better.
+3. **Feature set inadequate.** OBI carries the bulk of signal; ce_ratio
+   adds little; liquidation_rate is dead. A 1-feature model may extract
+   different/better with focused input.
+4. **Loss function fundamentally wrong.** Focal+BCE both find the
+   "predict near zero" trivial solution. Maybe ranking loss, contrastive
+   loss, or AUC-direct loss would avoid this.
+5. **Implicit label noise.** `identify_shock_events` uses price-spike +
+   VPIN criteria that may not match HL's actual microstructure shock
+   semantics; shocks we're labeling may not be the shocks the engineered
+   features predict.
+
+Dedicated research session planned (see plan file
+`~/.claude/plans/tcn-failure-investigation.md`) to characterize the
+root cause more rigorously than this progression of ad-hoc experiments.

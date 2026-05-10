@@ -31,6 +31,13 @@ _PAIR_DEFAULTS = {
     "AVAX/USD": {"tick": 0.001,   "min_order": 0.1,    "max_position": 200.0},
     "DOGE/USD": {"tick": 0.0001,  "min_order": 1.0,    "max_position": 50_000.0},
     "LINK/USD": {"tick": 0.001,   "min_order": 0.1,    "max_position": 500.0},
+    # Hyperliquid perps (CCXT format BTC/USDC:USDC). Position caps sized
+    # for prove-out — small notional, scale via MAX_POSITION_LIMIT env if
+    # leveraging up. Tick sizes mirror HL's published price increments.
+    "BTC/USDC:USDC":  {"tick": 0.5,    "min_order": 0.0001, "max_position": 0.05},
+    "ETH/USDC:USDC":  {"tick": 0.05,   "min_order": 0.001,  "max_position": 1.0},
+    "SOL/USDC:USDC":  {"tick": 0.001,  "min_order": 0.01,   "max_position": 50.0},
+    "HYPE/USDC:USDC": {"tick": 0.0001, "min_order": 0.1,    "max_position": 1000.0},
 }
 _pair = _PAIR_DEFAULTS.get(SYMBOL, {"tick": 0.01, "min_order": 0.01, "max_position": 50.0})
 TICK_SIZE = float(os.environ.get("TICK_SIZE", _pair["tick"]))
@@ -80,8 +87,14 @@ CALIBRATION_STALE = False     # Set True by drift monitor; pauses mandate genera
 if IS_EQUITY:
     TAKER_FEE = 0.0
     MAKER_FEE = 0.0
+elif EXCHANGE_ID == "hyperliquid":
+    # Hyperliquid perps default (non-VIP). HL offers rebates at higher tiers;
+    # these are conservative for prove-out so trained policy doesn't overfit
+    # to optimistic fees. Override the constants if your tier differs.
+    TAKER_FEE = 0.00045       # 4.5 bps
+    MAKER_FEE = 0.00015       # 1.5 bps
 else:
-    TAKER_FEE = 0.0060        # 60 bps
+    TAKER_FEE = 0.0060        # Coinbase Advanced spot — 60 bps
     MAKER_FEE = 0.0040        # 40 bps
 FEE_AGGRESSION_THRESHOLD = 0.0  # Action below threshold treated as taker.
 
@@ -134,6 +147,12 @@ CALIBRATION_REGISTRY = {
     "LINK/USD": 0.26,
     "BTC/USDT:USDT": 0.18,     # Legacy perp values, retained for back-compat
     "ETH/USDT:USDT": 0.22,
+    # Hyperliquid perps — initial estimates; refit via fit_ood_from_csv.py
+    # once fetch_history_hyperliquid.py has produced a feature_history CSV.
+    "BTC/USDC:USDC": 0.18,
+    "ETH/USDC:USDC": 0.22,
+    "SOL/USDC:USDC": 0.28,
+    "HYPE/USDC:USDC": 0.30,
 }
 ALPHA_CALIBRATION_C = CALIBRATION_REGISTRY.get(SYMBOL, 0.25)
 

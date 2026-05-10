@@ -315,6 +315,13 @@ disruption_arbitrage_engine/
 ├── IMPLEMENTATION.md         # full architectural rationale and runbooks
 ├── LAYER2_TRAINING.md        # TCN training research log: data, densities, results
 └── tests/  (top-level test_*.py files, not a package)
+    ├── test_features.py           # feature predictability diagnostic (KS-test
+    │                              #   pre-shock vs random windows; tells you
+    │                              #   whether the signal is in the data before
+    │                              #   chasing label/loss/data-volume tweaks)
+    ├── inspect_hl_liquidations.py # diagnostic: scan HL trade archive for
+    │                              #   `dir` values, identify the liquidation
+    │                              #   marker before wiring a venue adapter
     ├── test_sensors.py            # layer1 unit tests
     ├── test_calibration.py        # calibration helpers
     ├── test_matching_engine.py    # LocalMatchingEngine + structural isolation
