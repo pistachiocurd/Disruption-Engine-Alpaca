@@ -37,7 +37,10 @@ from config import (
     HMM_DOF_TURBULENT,
     IS_EQUITY,
     KALMAN_DOF,
+    KYLES_LAMBDA_LOOKBACK_TICKS,
     LIQUIDATION_WINDOW_SEC,
+    MIN_ORDER_SIZE,
+    MLOFI_DEPTH_LEVELS,
     OOD_THRESHOLD,
     SENSOR_LOOP_INTERVAL_SEC,
     SYMBOL,
@@ -684,6 +687,359 @@ class QuoteCancellationProxy:
 
 
 # ============================================================================
+# 1.6 Crypto-native microstructure features (Path D / P3.6, 2026-05-10)
+# ============================================================================
+# Added to replace the dead liquidation_rate channel on Hyperliquid and
+# expand the TCN input from 3 to 5 features. See LAYER2_TRAINING.md
+# §13.4 and TODO.md P3.6 for motivation.
+#
+# Equity path doesn't use these (no L2 depth from Alpaca, no per-trade
+# initiator field) — they stay at default 0.0 in PhysicsState and the
+# equity TCN_INPUT_CHANNELS=3 model doesn't read them.
+
+
+class MLOFITracker:
+    """Multi-Level Order Flow Imbalance (Xu et al. 2018) across top-K levels.
+
+    For each book snapshot, computes per-level (Δbid_size - Δask_size)
+    summed over the top-K depth levels and normalized by total top-K depth.
+    Captures bid/ask flow pressure beyond top-of-book OBI; less susceptible
+    to top-of-book spoofing because deeper levels are harder to fake.
+
+    Pure function of the current and previous snapshot — no internal
+    rolling window; smoothing is handled (if needed) by downstream
+    consumers via deque/EMA in the TCN's own receptive field.
+
+    Returns a scalar in roughly [-1, 1] for typical book depth.
+    """
+
+    def __init__(self, depth_levels: int = MLOFI_DEPTH_LEVELS) -> None:
+        self.depth_levels = depth_levels
+
+    def compute(self, prev_ob: Optional[dict], curr_ob: dict) -> float:
+        if prev_ob is None or not curr_ob.get("bids") or not curr_ob.get("asks"):
+            return 0.0
+        K = self.depth_levels
+        prev_bids = prev_ob.get("bids", [])[:K]
+        curr_bids = curr_ob.get("bids", [])[:K]
+        prev_asks = prev_ob.get("asks", [])[:K]
+        curr_asks = curr_ob.get("asks", [])[:K]
+
+        ofi = 0.0
+        for i in range(K):
+            pb = float(prev_bids[i][1]) if i < len(prev_bids) else 0.0
+            cb = float(curr_bids[i][1]) if i < len(curr_bids) else 0.0
+            pa = float(prev_asks[i][1]) if i < len(prev_asks) else 0.0
+            ca = float(curr_asks[i][1]) if i < len(curr_asks) else 0.0
+            ofi += (cb - pb) - (ca - pa)
+
+        total_depth = (
+            sum(float(b[1]) for b in curr_bids)
+            + sum(float(a[1]) for a in curr_asks)
+        )
+        if total_depth < EPSILON:
+            return 0.0
+        return ofi / total_depth
+
+    def reset_session(self) -> None:
+        pass  # stateless across the prev/curr pair
+
+
+class VAMPDeviationComputer:
+    """Volume-Adjusted Mid Price — queue-position-weighted mid (Stoikov 2018).
+
+    VAMP = (ask_sz * bid_px + bid_sz * ask_px) / (bid_sz + ask_sz).
+    Pulls the "true" mid toward whichever side has more queue weight: a
+    heavy ask queue → VAMP closer to bid (selling pressure expected).
+
+    Returns the *deviation* of VAMP from the arithmetic mid in basis
+    points (signed). Stateless; computed per snapshot.
+    """
+
+    @staticmethod
+    def compute(ob: dict, mid: float) -> float:
+        if not ob.get("bids") or not ob.get("asks") or mid <= 0:
+            return 0.0
+        bid_px = float(ob["bids"][0][0])
+        bid_sz = float(ob["bids"][0][1])
+        ask_px = float(ob["asks"][0][0])
+        ask_sz = float(ob["asks"][0][1])
+        denom = bid_sz + ask_sz
+        if denom < EPSILON:
+            return 0.0
+        vamp = (ask_sz * bid_px + bid_sz * ask_px) / denom
+        return (vamp - mid) / mid * 10_000.0  # signed basis points
+
+
+class KylesLambdaTracker:
+    """Kyle's λ — rolling regression of mid-return on signed trade volume.
+
+    Maintains deques of (per-tick) signed volume and mid prices. Trade
+    flow is accumulated between book snapshots via on_trade(); each
+    book snapshot commits the accumulated flow and recomputes λ from
+    the trailing lookback window using OLS:
+
+        λ ≈ cov(signed_vol_norm, returns) / var(signed_vol_norm)
+
+    Signed volume is normalized by recent average |flow| so λ is
+    dimensionless and roughly scale-invariant across coins. Typical
+    values: [0, 0.01] in calm markets, spiking during liquidity crises.
+
+    Higher λ = more price-impact-per-unit-flow = thinner book / less
+    resilient liquidity.
+    """
+
+    def __init__(self, lookback_ticks: int = KYLES_LAMBDA_LOOKBACK_TICKS) -> None:
+        self.lookback_ticks = lookback_ticks
+        self._signed_vol_buffer: deque = deque(maxlen=lookback_ticks)
+        self._mid_buffer: deque = deque(maxlen=lookback_ticks)
+        self._signed_vol_accum: float = 0.0
+        self._vol_window: deque = deque(maxlen=lookback_ticks)
+
+    def on_trade(self, side: str, qty: float) -> None:
+        """Accumulate signed volume between book snapshots.
+        side='buy' (taker bought ask) → +1; side='sell' → -1.
+        """
+        sign = 1.0 if side == "buy" else -1.0
+        self._signed_vol_accum += sign * qty
+
+    def on_book(self, mid: float) -> float:
+        """Commit accumulated flow as the current tick's signed volume
+        and recompute λ from the buffer. Returns scalar λ.
+        """
+        signed_vol = self._signed_vol_accum
+        self._signed_vol_accum = 0.0
+        self._signed_vol_buffer.append(signed_vol)
+        self._mid_buffer.append(mid)
+        self._vol_window.append(abs(signed_vol))
+
+        n = len(self._mid_buffer)
+        if n < 5:
+            return 0.0
+
+        # Normalize signed volume by recent average |flow| → dimensionless.
+        vol_avg = sum(self._vol_window) / max(len(self._vol_window), 1)
+        if vol_avg < EPSILON:
+            return 0.0
+
+        mids = np.asarray(self._mid_buffer, dtype=np.float64)
+        rets = np.diff(mids) / np.maximum(mids[:-1], EPSILON)  # length n-1
+        sv = np.asarray(self._signed_vol_buffer, dtype=np.float64)[1:] / vol_avg
+
+        sv_var = float(np.var(sv))
+        if sv_var < EPSILON:
+            return 0.0
+        cov = float(np.cov(sv, rets, bias=True)[0, 1])
+        return cov / sv_var
+
+    def reset_session(self) -> None:
+        self._signed_vol_buffer.clear()
+        self._mid_buffer.clear()
+        self._vol_window.clear()
+        self._signed_vol_accum = 0.0
+
+
+# ============================================================================
+# 1.11 Path G — Characteristic scales and dimensionless π-groups
+# ============================================================================
+# Phase 2+3 of `mini_projects/path_G_dimensionless/RESEARCH_PLAN.md` on
+# branch `research/path-g-dimensionless`. THEORY.md derives the π-groups;
+# BOUNDARY_CONDITIONS.md mandates the floor/saturation discipline below.
+# Not yet consumed by the TCN — TCN_INPUT_CHANNELS stays at 5 until a
+# harvest with these columns and a successful Phase 4 retraining lands.
+
+# Per-π tanh saturation scales — calibrated from the raw-ratio
+# 95th-percentile divided by 2, so typical values land in tanh's linear
+# range and saturation kicks in around p95. Pooled from 8.67M rows of
+# multi-coin harvest (BTC/ETH/SOL/HYPE × 14 days, HL 2026-03-24→04-06);
+# see LAYER2_TRAINING.md §13.13. `pi_kappa`'s 208× shift from the
+# BTC-only smoke calibration came from ETH/SOL/HYPE's thinner books
+# (larger κ) — depth heterogeneity is what made the pooled calibration
+# essential. Re-run calibrate_path_g_scales.py if the coin set changes.
+PATH_G_TANH_SCALES = {
+    "fo_market": 3.448,
+    "sr": 0.5566,
+    "pi_kappa": 0.0002875,
+    "pi_vamp_dim": 0.2315,
+}
+
+
+class CharacteristicScales:
+    """Path G — online rolling estimates of microstructure characteristic scales.
+
+    Maintains τ_c, L_c, D_c, V_c, κ_c online for use as denominators in the
+    dimensionless π-groups (Fo_market, Sr, π_κ, π_vamp_dim). All denominators
+    returned by `current()` are floored to their quantization unit
+    (`TICK_SIZE` for L_c, `min_tau_ms` for τ_c, `min_depth` for V_c) so the
+    π-groups don't blow up at the discrete boundaries of market data — see
+    `BOUNDARY_CONDITIONS.md`.
+
+        τ_c (tau_c_s) : rolling mean(Δt)        units: s
+        L_c           : rolling mean(spread)    units: P
+        D_c           : rolling mean(Δp²/Δt)    units: P²/s
+        V_c           : rolling Σ(qty)/window   units: Q/s
+        κ_c (kappa_c) : rolling mean(Kyle's λ)  units: P/Q
+
+    Feed via `on_trade(qty)` between book snapshots and `on_book(...)` on
+    each snapshot. The on_book call closes the per-tick volume bucket.
+    """
+
+    def __init__(
+        self,
+        lookback_ticks: int = 200,
+        tick_size: float = TICK_SIZE,
+        min_tau_ms: float = 1.0,
+        min_depth: float = MIN_ORDER_SIZE,
+    ) -> None:
+        self.lookback_ticks = lookback_ticks
+        self.tick_size = float(tick_size)
+        self.min_tau_ms = float(min_tau_ms)
+        self.min_depth = float(min_depth)
+
+        self._dt_ms_buffer: deque = deque(maxlen=lookback_ticks)
+        self._spread_buffer: deque = deque(maxlen=lookback_ticks)
+        self._dp_sq_per_s_buffer: deque = deque(maxlen=lookback_ticks)
+        self._volume_window: deque = deque(maxlen=lookback_ticks)
+        self._lambda_buffer: deque = deque(maxlen=lookback_ticks)
+
+        self._last_ts_ms: Optional[int] = None
+        self._last_mid: Optional[float] = None
+        self._trade_vol_accum: float = 0.0
+
+    def on_trade(self, qty: float) -> None:
+        """Accumulate per-trade volume between book snapshots. Sign-blind:
+        V_c tracks total throughput, not signed flow (Kyle's λ already
+        owns signed flow)."""
+        try:
+            self._trade_vol_accum += abs(float(qty))
+        except (TypeError, ValueError):
+            pass
+
+    def on_book(
+        self,
+        ts_ms: int,
+        mid: float,
+        spread: float,
+        kyles_lambda: float,
+    ) -> None:
+        """Update scales on each book snapshot. Closes the per-tick volume
+        bucket. Δt and Δp² samples require a previous snapshot — first
+        call is warmup."""
+        if self._last_ts_ms is not None:
+            dt_ms = max(self.min_tau_ms, float(ts_ms - self._last_ts_ms))
+            self._dt_ms_buffer.append(dt_ms)
+            if self._last_mid is not None:
+                dp = float(mid) - float(self._last_mid)
+                dt_s = max(dt_ms / 1000.0, EPSILON)
+                self._dp_sq_per_s_buffer.append((dp * dp) / dt_s)
+
+        self._spread_buffer.append(max(float(spread), self.tick_size))
+        self._volume_window.append(self._trade_vol_accum)
+        self._trade_vol_accum = 0.0
+        # Only push real samples; Kyle's λ is exactly 0 during warmup.
+        if kyles_lambda != 0.0:
+            self._lambda_buffer.append(float(kyles_lambda))
+
+        self._last_ts_ms = int(ts_ms)
+        self._last_mid = float(mid)
+
+    def current(self) -> dict:
+        """Return floored scale estimates. Safe to call at any time
+        (warm-up returns floor values for unsamplable quantities)."""
+        n_dt = len(self._dt_ms_buffer)
+        tau_c_s = (
+            (sum(self._dt_ms_buffer) / n_dt / 1000.0)
+            if n_dt > 0
+            else self.min_tau_ms / 1000.0
+        )
+        tau_c_s = max(tau_c_s, self.min_tau_ms / 1000.0)
+
+        n_s = len(self._spread_buffer)
+        L_c = (sum(self._spread_buffer) / n_s) if n_s > 0 else self.tick_size
+        L_c = max(L_c, self.tick_size)
+
+        n_d = len(self._dp_sq_per_s_buffer)
+        D_c = (sum(self._dp_sq_per_s_buffer) / n_d) if n_d > 0 else 0.0
+
+        n_v = len(self._volume_window)
+        total_vol = sum(self._volume_window) if n_v > 0 else 0.0
+        window_s = max(tau_c_s * max(n_v, 1), EPSILON)
+        V_c = max(self.min_depth, total_vol / window_s)
+
+        n_l = len(self._lambda_buffer)
+        kappa_c = (sum(self._lambda_buffer) / n_l) if n_l > 0 else 0.0
+
+        return {
+            "tau_c_s": tau_c_s,
+            "L_c": L_c,
+            "D_c": D_c,
+            "V_c": V_c,
+            "kappa_c": kappa_c,
+        }
+
+    def reset_session(self) -> None:
+        self._dt_ms_buffer.clear()
+        self._spread_buffer.clear()
+        self._dp_sq_per_s_buffer.clear()
+        self._volume_window.clear()
+        self._lambda_buffer.clear()
+        self._last_ts_ms = None
+        self._last_mid = None
+        self._trade_vol_accum = 0.0
+
+
+def compute_dimensionless_features(
+    dt_ms: float,
+    vamp_minus_mid_abs: float,
+    scales: dict,
+    tanh_scales: Optional[dict] = None,
+) -> dict:
+    """Compute Path G's dimensionless π-groups for one tick.
+
+    Wraps each raw ratio in tanh(raw / scale_factor) so the model sees a
+    bounded, differentiable saturation at quantization boundaries
+    instead of an unbounded blow-up (BOUNDARY_CONDITIONS.md §"Mitigation 2").
+    Denominators in `scales` are already floored by `CharacteristicScales`.
+
+    Returns four keys, each in (-1, +1):
+        fo_market   = tanh(D·Δt/L² / scale)       diffusion vs tick interval
+        sr          = tanh(Δt/τ_c   / scale)      local vs recent cadence
+        pi_kappa    = tanh(κ·V·τ/L  / scale)      dimensionless price impact
+        pi_vamp_dim = tanh((VAMP-mid)/L / scale)  queue deviation in spread units
+    """
+    if tanh_scales is None:
+        tanh_scales = PATH_G_TANH_SCALES
+
+    L_c = scales["L_c"]
+    L_c_sq = L_c * L_c
+    tau_c_s = scales["tau_c_s"]
+    D_c = scales["D_c"]
+    V_c = scales["V_c"]
+    kappa_c = scales["kappa_c"]
+
+    dt_s = max(float(dt_ms) / 1000.0, EPSILON)
+
+    fo_market_raw = D_c * dt_s / L_c_sq
+    fo_market = math.tanh(fo_market_raw / tanh_scales["fo_market"])
+
+    sr_raw = dt_s / tau_c_s
+    sr = math.tanh(sr_raw / tanh_scales["sr"])
+
+    pi_kappa_raw = kappa_c * V_c * tau_c_s / L_c
+    pi_kappa = math.tanh(pi_kappa_raw / tanh_scales["pi_kappa"])
+
+    pi_vamp_raw = float(vamp_minus_mid_abs) / L_c
+    pi_vamp_dim = math.tanh(pi_vamp_raw / tanh_scales["pi_vamp_dim"])
+
+    return {
+        "fo_market": float(fo_market),
+        "sr": float(sr),
+        "pi_kappa": float(pi_kappa),
+        "pi_vamp_dim": float(pi_vamp_dim),
+    }
+
+
+# ============================================================================
 # Sensor Array — orchestrator
 # ============================================================================
 @dataclass
@@ -699,6 +1055,28 @@ class PhysicsState:
     ce_ratio: float = 0.0
     obi: float = 0.0                 # order book imbalance
     spread_velocity: float = 0.0
+    # Path D crypto-native features (P3.6 / §13.4 of LAYER2_TRAINING.md).
+    # Populated for HL crypto; zero on equities (no L2 depth from Alpaca,
+    # equity TCN_INPUT_CHANNELS=3 doesn't consume them).
+    mlofi: float = 0.0               # multi-level OFI, top-K levels
+    vamp: float = 0.0                # VAMP - mid, in basis points
+    kyles_lambda: float = 0.0        # price-impact-per-unit-flow
+    # Path G dimensionless features (research/path-g-dimensionless;
+    # §13.13). Tanh-bounded (-1, +1). NOT yet consumed by the TCN —
+    # TCN_INPUT_CHANNELS stays at 5 until a harvest with these columns
+    # and a successful Phase 4 retraining lands.
+    fo_market: float = 0.0           # tanh(D·Δt/L²)
+    sr: float = 0.0                  # tanh(Δt/τ_c)
+    pi_kappa: float = 0.0            # tanh(κ·V·τ/L)
+    pi_vamp_dim: float = 0.0         # tanh((VAMP−mid)/L)
+    # Raw characteristic scales — preserved alongside the π-groups so a
+    # future harvest can re-derive the dimensionless features with a
+    # different tanh saturation calibration without re-running the engine.
+    tau_c_s: float = 0.0
+    L_c: float = 0.0
+    D_c: float = 0.0
+    V_c: float = 0.0
+    kappa_c: float = 0.0
     timestamp: int = 0
     ob_snapshot: Optional[dict] = field(default=None, repr=False)
     prev_ob_snapshot: Optional[dict] = field(default=None, repr=False)
@@ -714,9 +1092,20 @@ class FeatureDumper:
     won't lose the recent rows.
     """
 
+    # Path D columns: ce_ratio, obi, mlofi, vamp, kyles_lambda (§13.4).
+    # Path G columns: fo_market, sr, pi_kappa, pi_vamp_dim (the π-groups)
+    # plus the raw characteristic scales (tau_c_s, L_c, D_c, V_c, kappa_c)
+    # and the raw top-of-book sizes (bid_sz_top, ask_sz_top) — the latter
+    # two are book-level quantities a future harvest can use to re-derive
+    # the π-groups under a different tanh calibration. Old CSVs that lack
+    # the Path G columns remain readable by polars (column-name lookup);
+    # readers that touch the new columns must handle absence.
     HEADER = (
         "timestamp_ms,ce_ratio,obi,liquidation_rate,vpin,regime,mahal_dist,"
-        "best_bid,best_ask\n"
+        "best_bid,best_ask,mlofi,vamp,kyles_lambda,"
+        "fo_market,sr,pi_kappa,pi_vamp_dim,"
+        "tau_c_s,L_c,D_c,V_c,kappa_c,"
+        "bid_sz_top,ask_sz_top\n"
     )
 
     def __init__(self, path: str | Path) -> None:
@@ -732,16 +1121,24 @@ class FeatureDumper:
     def record(self, state: "PhysicsState") -> None:
         try:
             best_bid = best_ask = 0.0
+            bid_sz_top = ask_sz_top = 0.0
             ob = state.ob_snapshot
             if ob:
                 if ob.get("bids"):
                     best_bid = float(ob["bids"][0][0])
+                    bid_sz_top = float(ob["bids"][0][1])
                 if ob.get("asks"):
                     best_ask = float(ob["asks"][0][0])
+                    ask_sz_top = float(ob["asks"][0][1])
             self._fh.write(
                 f"{state.timestamp},{state.ce_ratio:.6f},{state.obi:.6f},"
                 f"{state.liquidation_rate:.6f},{state.vpin:.6f},{state.regime},"
-                f"{state.mahal_dist:.6f},{best_bid:.6f},{best_ask:.6f}\n"
+                f"{state.mahal_dist:.6f},{best_bid:.6f},{best_ask:.6f},"
+                f"{state.mlofi:.6f},{state.vamp:.6f},{state.kyles_lambda:.8f},"
+                f"{state.fo_market:.6f},{state.sr:.6f},{state.pi_kappa:.6f},"
+                f"{state.pi_vamp_dim:.6f},{state.tau_c_s:.6f},{state.L_c:.6f},"
+                f"{state.D_c:.8f},{state.V_c:.6f},{state.kappa_c:.8f},"
+                f"{bid_sz_top:.6f},{ask_sz_top:.6f}\n"
             )
             self.rows_written += 1
         except Exception as e:
@@ -799,6 +1196,20 @@ class SensorArray:
         self.ce = QuoteCancellationProxy() if IS_EQUITY else CEInferenceEngine()
         self.feature_dumper = feature_dumper
 
+        # Path D crypto-native trackers. Instantiated only for crypto (no
+        # L2 depth or per-trade initiator field on equities). MLOFI is
+        # stateless across snapshots; VAMP is a static helper, no instance.
+        # Path G adds CharacteristicScales for the dimensionless π-groups
+        # (research/path-g-dimensionless; §13.13). Same crypto-only gating.
+        if not IS_EQUITY:
+            self.mlofi = MLOFITracker(depth_levels=MLOFI_DEPTH_LEVELS)
+            self.kyles = KylesLambdaTracker(lookback_ticks=KYLES_LAMBDA_LOOKBACK_TICKS)
+            self.scales = CharacteristicScales(lookback_ticks=KYLES_LAMBDA_LOOKBACK_TICKS)
+        else:
+            self.mlofi = None
+            self.kyles = None
+            self.scales = None
+
         self.state = PhysicsState()
         self._prev_ob: Optional[dict] = None
         self._recent_trades: deque = deque()  # for C/E inference window
@@ -852,6 +1263,15 @@ class SensorArray:
                 self.ce.on_trade(ts)
         else:
             self.vpin.add_trade(trade)
+            qty = float(trade["amount"])
+            # Path D — accumulate signed flow for Kyle's λ between book ticks.
+            # ccxt + HL archive both expose trade["side"] ∈ {"buy", "sell"}.
+            if self.kyles is not None:
+                self.kyles.on_trade(trade["side"], qty)
+            # Path G — accumulate per-trade volume for V_c. Sign-blind: V_c
+            # tracks throughput (Q/s rate); signed flow is Kyle's λ's job.
+            if self.scales is not None:
+                self.scales.on_trade(qty)
 
         self._recent_trades.append(trade)
         cutoff = ts - int(CE_ROLLING_WINDOW_SEC * 1000)
@@ -872,9 +1292,11 @@ class SensorArray:
 
         # Spread first derivative
         if self._spread_prev is not None and self._spread_prev_ts_ms is not None:
+            dt_ms_since_prev = float(ts_ms - self._spread_prev_ts_ms)
             dt = max(1, ts_ms - self._spread_prev_ts_ms) / 1000.0
             spread_d1 = (spread - self._spread_prev) / dt
         else:
+            dt_ms_since_prev = 0.0
             spread_d1 = 0.0
         self._spread_prev = spread
         self._spread_prev_ts_ms = ts_ms
@@ -913,13 +1335,69 @@ class SensorArray:
         # Liquidation rate (normalized by recent volume)
         liq_rate = self.liquidation.liquidation_rate(self.vpin.average_volume_10s)
 
-        # HMM update — 4 emission features
+        # Path D crypto-native features. Computed only for crypto venues;
+        # equities don't have multi-level depth or trade-side fields, and
+        # the equity TCN_INPUT_CHANNELS=3 model doesn't consume them.
+        if self.mlofi is not None:
+            mlofi = self.mlofi.compute(self._prev_ob, ob)
+            vamp = VAMPDeviationComputer.compute(ob, mid)
+            kyles_lambda = self.kyles.on_book(mid)
+        else:
+            mlofi = 0.0
+            vamp = 0.0
+            kyles_lambda = 0.0
+
+        # Path G — characteristic scales + dimensionless π-groups
+        # (research/path-g-dimensionless; LAYER2_TRAINING.md §13.13).
+        # Same crypto-only gating as Path D. The π-groups are tanh-bounded
+        # in compute_dimensionless_features per BOUNDARY_CONDITIONS.md.
+        # NOT yet consumed by the TCN — these columns are emitted only so
+        # a future re-harvest produces training data with the new schema.
+        if self.scales is not None:
+            self.scales.on_book(ts_ms, mid, spread, kyles_lambda)
+            scales_now = self.scales.current()
+            # VAMP is in basis points relative to mid; convert back to
+            # absolute P for the dimensionless π_vamp ratio.
+            vamp_minus_mid_abs = (vamp / 1e4) * mid
+            pi_groups = compute_dimensionless_features(
+                dt_ms=dt_ms_since_prev,
+                vamp_minus_mid_abs=vamp_minus_mid_abs,
+                scales=scales_now,
+            )
+            fo_market = pi_groups["fo_market"]
+            sr_val = pi_groups["sr"]
+            pi_kappa = pi_groups["pi_kappa"]
+            pi_vamp_dim = pi_groups["pi_vamp_dim"]
+            tau_c_s = scales_now["tau_c_s"]
+            L_c = scales_now["L_c"]
+            D_c = scales_now["D_c"]
+            V_c = scales_now["V_c"]
+            kappa_c = scales_now["kappa_c"]
+        else:
+            fo_market = 0.0
+            sr_val = 0.0
+            pi_kappa = 0.0
+            pi_vamp_dim = 0.0
+            tau_c_s = 0.0
+            L_c = 0.0
+            D_c = 0.0
+            V_c = 0.0
+            kappa_c = 0.0
+
+        # HMM update — 4 emission features (unchanged; HMM stays on the
+        # original [ce_ratio, obi, spread_d1, liq_rate] vector; refitting
+        # the HMM for HL is deferred — see TODO.md P5).
         hmm_obs = np.array([self.ce.ce_ratio, obi, spread_d1, liq_rate])
         regime = self.hmm.update(hmm_obs)
 
-        # OOD check — 3-feature TCN input vector
-        tcn_obs = np.array([self.ce.ce_ratio, obi, liq_rate])
-        ood_flag, mahal = self.ood.evaluate(tcn_obs)
+        # OOD check — 3-feature vector. Stays on the original feature set
+        # for back-compat with existing per-symbol OOD calibrations. HL's
+        # OOD is currently uncalibrated (TODO.md P1) so the dead
+        # liquidation channel here is a known degenerate axis until
+        # either P1 lands a real source or OOD is refit on the new
+        # crypto-native vector.
+        ood_obs = np.array([self.ce.ce_ratio, obi, liq_rate])
+        ood_flag, mahal = self.ood.evaluate(ood_obs)
         # During the post-open warmup window, suppress OOD trips so the first
         # quotes don't fire a false-positive shock signal while the filters
         # re-warm. The mahalanobis distance is still recorded for telemetry.
@@ -938,6 +1416,18 @@ class SensorArray:
             ce_ratio=self.ce.ce_ratio,
             obi=obi,
             spread_velocity=spread_d1,
+            mlofi=mlofi,
+            vamp=vamp,
+            kyles_lambda=kyles_lambda,
+            fo_market=fo_market,
+            sr=sr_val,
+            pi_kappa=pi_kappa,
+            pi_vamp_dim=pi_vamp_dim,
+            tau_c_s=tau_c_s,
+            L_c=L_c,
+            D_c=D_c,
+            V_c=V_c,
+            kappa_c=kappa_c,
             timestamp=ts_ms,
             ob_snapshot=ob,
             prev_ob_snapshot=self._prev_ob,
@@ -970,6 +1460,14 @@ class SensorArray:
             self.hmm.reset_session()
         # Both CE backends expose reset_session().
         self.ce.reset_session()
+        # Path D trackers (None on equities).
+        if self.kyles is not None:
+            self.kyles.reset_session()
+        if self.mlofi is not None:
+            self.mlofi.reset_session()
+        # Path G — characteristic scales (None on equities).
+        if self.scales is not None:
+            self.scales.reset_session()
 
         self._prev_ob = None
         self._spread_prev = None

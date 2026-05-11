@@ -92,25 +92,46 @@ def _find_equilibrium_tick(
 def identify_shock_events(
     ob_snapshots: list[dict],
     vpin_series: list[float],
+    D_c_series: Optional[list[float]] = None,
+    k_sigma: float = 3.0,
+    min_pct_floor: float = 0.0,
 ) -> list[ShockEvent]:
     """
-    Returns the list of shock events satisfying ALL three conditions from the spec.
+    Returns the list of shock events satisfying ALL three conditions.
 
     Args:
         ob_snapshots: aligned list of L2 snapshots (each with 'timestamp', 'bids', 'asks').
         vpin_series: VPIN value at each snapshot (same length as ob_snapshots).
+        D_c_series:  (Optional) rolling realized variance per tick, P²/s,
+                     from Path G's CharacteristicScales. If provided, the
+                     price-move trigger uses k-sigma absolute moves instead
+                     of the fixed SHOCK_PRICE_MOVE_PCT relative-move trigger.
+        k_sigma:     threshold in σ units for the vol-scaled trigger (default 3.0).
+                     Ignored if D_c_series is None.
+        min_pct_floor: minimum relative-move floor for the hybrid trigger
+                     (§13.15). When > 0 AND D_c_series is provided, the
+                     per-tick threshold becomes max(k·σ·√Δt, floor·p) —
+                     requires both statistical rarity AND structural
+                     significance. Prevents vol-scaled trigger from firing
+                     on micro-noise during quiet regimes.
 
     Conditions for a valid shock:
         1. vpin_at_t > TURBULENCE_THRESHOLD
-        2. |price_move| / price > SHOCK_PRICE_MOVE_PCT within MAX_DIFFUSION_TICKS
+        2a. (Legacy: D_c_series=None) |price_move|/price > SHOCK_PRICE_MOVE_PCT
+            within MAX_DIFFUSION_TICKS
+        2b. (Vol-scaled: D_c_series provided) |price_move| > max(k_sigma·√(D_c[t]·Δt_s),
+            min_pct_floor·p_trigger) within MAX_DIFFUSION_TICKS — §13.14/§13.15
         3. > MIN_SHOCK_SPACING_SECONDS since the previous accepted event
     """
     if len(ob_snapshots) != len(vpin_series):
         raise ValueError("ob_snapshots and vpin_series must be the same length.")
+    if D_c_series is not None and len(D_c_series) != len(ob_snapshots):
+        raise ValueError("D_c_series must be the same length as ob_snapshots.")
 
     events: list[ShockEvent] = []
     last_event_ts_ms = -1e18
     n = len(ob_snapshots)
+    use_vol_scaled = D_c_series is not None
 
     for t in range(n):
         vpin = vpin_series[t]
@@ -119,13 +140,31 @@ def identify_shock_events(
         ts = int(ob_snapshots[t]["timestamp"])
         if (ts - last_event_ts_ms) < MIN_SHOCK_SPACING_SECONDS * 1000:
             continue
+        # Skip ticks where D_c hasn't warmed up — no meaningful threshold yet.
+        if use_vol_scaled and D_c_series[t] <= 0:
+            continue
 
         p_trigger = _mid_price(ob_snapshots[t])
         moved = False
         for dt in range(1, min(MAX_DIFFUSION_TICKS, n - t)):
             p_later = _mid_price(ob_snapshots[t + dt])
-            move_pct = abs(p_later - p_trigger) / p_trigger
-            if move_pct > SHOCK_PRICE_MOVE_PCT:
+            if use_vol_scaled:
+                ts_later = int(ob_snapshots[t + dt]["timestamp"])
+                dt_s = max((ts_later - ts) / 1000.0, EPSILON)
+                vol_threshold = k_sigma * (D_c_series[t] * dt_s) ** 0.5
+                # Hybrid floor (§13.15): require structural significance
+                # too, so we don't fire on Brownian noise during quiet
+                # regimes. When min_pct_floor=0 this degenerates to
+                # pure vol-scaled (back-compat with §13.14 design).
+                floor_threshold = min_pct_floor * p_trigger
+                threshold_abs = max(vol_threshold, floor_threshold)
+                triggered = abs(p_later - p_trigger) > threshold_abs
+                # Compute move_pct for the ShockEvent record (back-compat).
+                move_pct = abs(p_later - p_trigger) / p_trigger
+            else:
+                move_pct = abs(p_later - p_trigger) / p_trigger
+                triggered = move_pct > SHOCK_PRICE_MOVE_PCT
+            if triggered:
                 eq_tick = _find_equilibrium_tick(ob_snapshots, t + dt)
                 if eq_tick is None:
                     break

@@ -127,6 +127,12 @@ CE_ROLLING_WINDOW_SEC = 5.0
 # Liquidation cascade
 LIQUIDATION_WINDOW_SEC = 10.0
 
+# Crypto-native microstructure features (Path D / P3.6, 2026-05-10).
+# Used on Hyperliquid to replace the dead liquidation_rate channel and
+# expand the TCN input from 3 → 5 features. See LAYER2_TRAINING.md §13.4.
+MLOFI_DEPTH_LEVELS = 5                  # top-K book levels for multi-level OFI
+KYLES_LAMBDA_LOOKBACK_TICKS = 100       # rolling window for λ regression
+
 # OOD detector
 OOD_THRESHOLD = 4.5
 
@@ -159,7 +165,15 @@ ALPHA_CALIBRATION_C = CALIBRATION_REGISTRY.get(SYMBOL, 0.25)
 # Shock event identification
 SHOCK_PRICE_MOVE_PCT = 0.0025           # DEFAULT: 0.3%
 MIN_SHOCK_SPACING_SECONDS = 60
-MAX_DIFFUSION_TICKS = 6000              #DEFAULT 20
+MAX_DIFFUSION_TICKS = 6000              # DEFAULT 20. Reverted from 2000
+                                        # to 6000 on 2026-05-12 for §14
+                                        # per-symbol baseline (matches the
+                                        # §13.4 / §13.10 protocol). The
+                                        # 2000-tick window (§13.12) and
+                                        # 600-tick window (§13.11) were
+                                        # both TESTED NEGATIVE; window
+                                        # tightening as a label-refinement
+                                        # strategy is exhausted (§13.15).
 
 # TCN leading-classifier horizon (used by train_stream.py). For each shock
 # event at tick t, the H ticks in [t-H, t) are labeled positive — i.e. the
@@ -168,10 +182,35 @@ MAX_DIFFUSION_TICKS = 6000              #DEFAULT 20
 # stays well within session boundaries). Crypto pipelines using train_tcn.py
 # still consume MAX_DIFFUSION_TICKS above for back-compat.
 TCN_LABEL_HORIZON_TICKS = 30
+# Pivot 2 Option C — directional-bias prediction horizon (§14).
+# `label[t] = 1 iff mid[t+H] > mid[t]`. H must be far enough that
+# the spread is actually breached (otherwise just predicting bid-ask
+# bounce). 100 ticks ≈ 55 s at HL's ~1.8 ticks/s — well past the
+# typical spread-roundtrip timescale.
+TCN_DIRECTIONAL_HORIZON_TICKS = 100
 EQUILIBRIUM_BAND_PCT = 0.002           # DEFAULT 0.1% (0.001)
 EQUILIBRIUM_STABILITY_TICKS = 300        #DEFAULT: 10
 MIN_CALIBRATION_EVENTS = 30
 TURBULENCE_THRESHOLD = 0.5              #DEFAULT: 0.9
+
+# Per-symbol vol-scaled label trigger (LAYER2_TRAINING.md §13.14 / option
+# 2d). When enabled, `identify_shock_events` replaces the fixed
+# `SHOCK_PRICE_MOVE_PCT` trigger with `|Δp| > SHOCK_K_SIGMA × √(D_c · Δt)`
+# — a k-sigma move in absolute price units, where D_c is the rolling
+# realized variance (P²/s) Path G computes online and the CSV preserves.
+# Same statistical event across symbols regardless of their volatility
+# regime — fixes the §13.14 finding that 0.25% triggers fire on HYPE's
+# Brownian noise but only on BTC's real shocks.
+USE_VOL_SCALED_LABELS = os.environ.get("USE_VOL_SCALED_LABELS", "0") == "1"
+SHOCK_K_SIGMA = float(os.environ.get("SHOCK_K_SIGMA", "3.0"))
+# Hybrid trigger floor (§13.15 final attempt): when USE_VOL_SCALED_LABELS=1
+# the per-tick threshold is max(k_sigma · √(D_c · Δt), SHOCK_MIN_PCT_FLOOR · p).
+# The floor prevents the vol-scaled threshold from collapsing to micro-noise
+# during quiet regimes (e.g., 5σ on a dead asset can be 5 bps absolute —
+# pure Brownian, no microstructure precursor). 15 bps default is wide
+# enough to require real liquidity absorption, narrow enough that even thin
+# books like HYPE trigger on real moves. Set to 0.0 to disable (pure vol-scaled).
+SHOCK_MIN_PCT_FLOOR = float(os.environ.get("SHOCK_MIN_PCT_FLOOR", "0.0"))
 
 # Drift detection
 DRIFT_THRESHOLD = 0.35                 # MAPE threshold
@@ -185,7 +224,24 @@ EWLS_DECAY = 0.95                      # Exponentially weighted OLS decay
 # Layer 2 — Alpha generation
 # ============================================================================
 TCN_INPUT_LENGTH = 60
-TCN_INPUT_CHANNELS = 3                 # [ce_ratio, obi, liquidation_rate]
+# Per-exchange TCN input channels. Hyperliquid uses the Path D
+# crypto-native feature set [ce_ratio, obi, mlofi, vamp, kyles_lambda]
+# (5 channels) — replaces the dead liquidation_rate channel and adds
+# multi-level depth + queue-position + price-impact signal. Equities
+# and non-HL crypto stay on the original [ce_ratio, obi, liquidation_rate]
+# (3 channels) so existing TSLA/NVDA weights remain loadable.
+#
+# Path G (research/path-g-dimensionless; §13.13) appends the four
+# dimensionless π-groups [fo_market, sr, pi_kappa, pi_vamp_dim] for HL
+# only, gated by USE_PATH_G_FEATURES=1 in the env so Path D training
+# stays the default. Mirrored in train_stream.py's feature stack; live
+# inference parity (AlphaEngine._push_features) is NOT yet updated —
+# do not deploy with weights from this path.
+USE_PATH_G_FEATURES = os.environ.get("USE_PATH_G_FEATURES", "0") == "1"
+if EXCHANGE_ID == "hyperliquid":
+    TCN_INPUT_CHANNELS = 9 if USE_PATH_G_FEATURES else 5
+else:
+    TCN_INPUT_CHANNELS = 3
 TCN_HIDDEN_CHANNELS = 32
 TCN_DILATIONS = (1, 2, 4, 8, 16)
 

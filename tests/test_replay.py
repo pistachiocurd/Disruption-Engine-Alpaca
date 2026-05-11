@@ -88,20 +88,25 @@ class ReplaySensorArray:
         self._prev_ob = ob
         self._prev_spread = spread
         # Compute mahal_dist from the loaded OODDetector if available; this
-        # mirrors what live SensorArray does at layer1_sensors.py:896. The CSV
+        # mirrors what live SensorArray does at layer1_sensors.py. The CSV
         # column's value was produced with whatever μ/Σ existed at harvest
         # (likely identity-prior, hence inflated 50+ values), so prefer the
-        # in-memory calibrated detector when present.
+        # in-memory calibrated detector when present. OOD still uses the
+        # 3-feature vector even on HL (where the TCN itself is 5-feature) —
+        # see Path D notes in layer1_sensors._process_order_book.
         if self._ood is not None:
-            tcn_obs = np.array([
+            ood_obs = np.array([
                 float(row["ce_ratio"]),
                 float(row["obi"]),
                 float(row["liquidation_rate"]),
             ])
-            ood_flag, mahal = self._ood.evaluate(tcn_obs)
+            ood_flag, mahal = self._ood.evaluate(ood_obs)
         else:
             mahal = float(row["mahal_dist"])
             ood_flag = mahal > config.OOD_THRESHOLD
+        # Path D crypto-native columns may be absent in older CSVs
+        # (pre-2026-05-10 HL harvests, or any equity CSV). Default to 0.0
+        # so a single ReplaySensorArray works across all CSV vintages.
         return PhysicsState(
             vpin=float(row["vpin"]),
             alpha_calibrated=self._alpha_c,
@@ -114,6 +119,9 @@ class ReplaySensorArray:
             ce_ratio=float(row["ce_ratio"]),
             obi=float(row["obi"]),
             spread_velocity=spread_velocity,
+            mlofi=float(row.get("mlofi", 0.0)),
+            vamp=float(row.get("vamp", 0.0)),
+            kyles_lambda=float(row.get("kyles_lambda", 0.0)),
             timestamp=int(row["timestamp_ms"]),
             ob_snapshot=ob,
             prev_ob_snapshot=prev_ob,

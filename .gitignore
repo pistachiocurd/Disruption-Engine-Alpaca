@@ -69,3 +69,21 @@ _*_temp.md
 calibration/feature_history_*.csv
 calibration/synthetic_history.csv
 calibration/shock_validation.csv
+
+# Eval-specific per-run artifacts (kept locally for debugging; the
+# operating-point .json/.csv produced at training time are still committed).
+calibration/tcn_threshold_eval_*
+calibration/tcn_threshold_sweep_eval_*
+
+# Inspection plot directories (image artifacts from tests/inspect_shocks.py).
+calibration/inspection*/
+
+# HL liquidations cache (re-downloaded by fetch_history_hyperliquid.py on demand).
+calibration/hl_liquidations.csv
+
+# Horizon-variant weight backups (only the canonical operating-point weights
+# are committed; backups like _H100.pt, _H500.pt are local-only).
+calibration/tcn_weights_*_H*.pt
+
+# Claude Code session metadata (worktrees, agent state).
+.claude/

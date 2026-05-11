@@ -1,18 +1,31 @@
 # Disruption Arbitrage Engine
 
-> **Status**: Private research prototype, shared with a small invited
-> audience. Layer 1–2 trained and calibrated; Layer 3 (PPO execution)
-> untrained and the open frontier of the project. **Not production-ready** —
-> `_live_submit` is a stub by design; the engine runs in shadow mode against
-> simulated fills.
+> **Status (2026-05-12)**: Private research prototype. **L2 investigation
+> formally closed** — the Path D feature set (CE ratio, OBI, MLOFI, VAMP,
+> Kyle's λ) carries real directional signal (~55% paper accuracy at H=100
+> ticks) but at magnitudes too small to overcome maker+taker execution
+> costs: gross edge ≈ 0.06 bps per trade vs round-trip cost ≈ 5.5 bps.
+> Full Phase A backtest in [LAYER2_TRAINING.md §14.7-§14.8](LAYER2_TRAINING.md).
+> **Next research generation pivots to L3 (order-by-order) microstructure
+> data** — queue depletion, cancellation velocity, order lifespan — which
+> L2 snapshots aggregate away. Codebase preserved as the L2 reference
+> baseline (anything L3 builds must beat F2=0.106 in-domain / max-prec
+> 1.5× base / 0.06 bps gross directional edge). **Not production-ready** —
+> `_live_submit` is a stub by design; the engine runs in shadow mode
+> against simulated fills.
 
 ![Engine running in shadow mode against TSLA replay](docs/screenshots/dashboard_running.png)
 
-Physics-informed market-making / shock-arbitrage engine. Detects pre-shock
-microstructure signatures, computes a post-shock equilibrium price via
-attrition-adjusted heat-equation diffusion, and executes the resulting
-mandate through a fee-aware PPO agent that is continuously retrained in
-the background.
+Physics-informed market microstructure research engine. Originally built
+as a shock-arbitrage system: detect pre-shock signatures via L2-aggregate
+features (a 5-channel TCN over a 60-tick rolling window), compute a
+post-shock equilibrium price via attrition-adjusted heat-equation
+diffusion, execute the resulting mandate through a fee-aware PPO agent.
+After exhaustive L2 investigation (§13: eight refinement strategies;
+§14: directional reframe), the L2-feature thesis is closed — signal
+exists but magnitude is too small for any reasonable execution
+framework. The architecture pivots to L3 microstructure for the next
+generation; the L2 codebase is preserved as the calibrated baseline.
 
 ## Architecture at a glance
 
@@ -289,6 +302,26 @@ traded single names like NVDA and TSLA. Implication for symbol
 selection on this feed: prioritize venue overlap with IEX over
 absolute notional volume.
 
+### L2 closure (2026-05-12)
+
+The two-week §13 investigation tested eight refinement strategies
+(loss function, architecture, features, label window, dimensionless
+features, vol-scaled labels, hybrid trigger, per-symbol training)
+against the shock-prediction baseline of F2 = 0.121. None lifted
+the ceiling above F2 ≈ 0.10-0.11 in-domain with proper temporal
+holdout. §14 pivoted to directional prediction (`mid[t+H] > mid[t]`)
+and found a real signal — 55% paper accuracy at H=100, +10pp over
+random walk — but the Phase A backtest (`backtest_directional.py`)
+showed the *magnitude* of the predicted moves is too small to clear
+the round-trip execution cost: 0.06 bps gross edge vs 5.5 bps fee
+bill, even under the most permissive (zero-adverse-selection) fill
+model. Retraining at H=500 destroys the edge entirely (microstructure
+signal decays past ~100 ticks). The L2 feature set carries genuine
+but magnitude-insufficient predictive information. Path forward is
+L3 (order-by-order) data, where the queue dynamics that L2
+aggregates destroy may survive at tradeable magnitude. Detailed
+write-up: [LAYER2_TRAINING.md §14.7-§14.8](LAYER2_TRAINING.md).
+
 ## File layout
 
 ```
@@ -423,18 +456,52 @@ Only then flip `SHADOW_MODE=False` and `EXCHANGE_LIVE=true`.
 
 ## Open work / collaboration
 
+The L2 chapter is closed. The dominant open frontier is the L3 pivot.
 Three concrete pieces that someone clone-and-explore could pick up:
 
-### 1. Layer 3 PPO is the open frontier
+### 1. L3 (order-by-order) microstructure data pivot — the new frontier
+
+L2 snapshot-based features (Path D: CE ratio, OBI, MLOFI, VAMP, Kyle's λ)
+were exhaustively tested and shown to carry real but magnitude-insufficient
+directional signal (see [LAYER2_TRAINING.md §14.7-§14.8](LAYER2_TRAINING.md)).
+The architectural premise — that *snapshots of book state* contain enough
+information to predict shocks or tradeable directional moves — is
+empirically falsified at this venue/time-resolution combination. The
+queue dynamics that *precede* book-state changes (order arrivals,
+cancellations, modifications, hidden-order inference from price-improvement
+events, order lifespan distributions) are aggregated away by L2 snapshots.
+
+What L3 requires:
+
+1. **Data source.** Hyperliquid's S3 archive is L2-only as far as
+   verified; need (a) an L3-emitting venue with a public archive
+   (Binance tick data, Coinbase Advanced order-by-order, Databento for
+   futures), (b) live L3 capture forward from the WebSocket feed, or
+   (c) reconstruction from delta-stream data if accessible.
+2. **New sensor classes in `layer1_sensors.py`** that consume *order
+   events*, not snapshots: per-side cancellation rate, order-lifespan
+   distribution, queue-position evolution, hidden-order inference,
+   trade-aggressor sequencing. Path G's `BOUNDARY_CONDITIONS.md`
+   already noted that the discrete quantum of market data is the
+   order-event, not the snapshot.
+3. **Replacement TCN feature stack.** Path D's 5 channels become a
+   small subset of the new stack; `TCN_INPUT_CHANNELS` likely grows
+   to 10-20. Calibration and training infrastructure (`calibration.py`,
+   `train_stream.py`, `backtest_directional.py`) carries over with
+   schema extensions.
+4. **L2 codebase frozen as reference baseline.** Anything L3 builds
+   must beat F2=0.106 (in-domain, temporal val) and 0.06 bps gross
+   directional edge per trade.
+
+### 2. (Frozen, pending L3 architecture) Layer 3 PPO
 
 The execution agent (`layer3_execution.py`) is structurally complete — full
 `ExecutionEnv`, `PPOAgent` with split CNN encoders, `PPOTrainer` with GAE,
 clipped surrogate, and entropy regularization — but it is **random-init at
-every session start**. Layer 4's `ShadowSimulator` collects replay data and
-trains a shadow agent online; promotion to the live agent is gated on a
-three-condition stability check (KL < 0.1, regime match, ≥ 50K steps), then
-Polyak-averaged with τ=0.05. In practice no single session accumulates
-enough data for the gate to fire.
+every session start**, and the L2 mandate it was built to consume is no
+longer the active alpha generator. Resuming PPO development is gated on
+the L3 architecture defining a new mandate shape (likely continuous
+inventory skew + confidence rather than discrete IS-targeted execution).
 
 Specific open problem: a saved-and-loadable PPO checkpoint flow that
 respects the regime-match assumption. Naive load-on-boot would push
@@ -443,7 +510,7 @@ abstraction is regime-keyed checkpoints (load the weights matching today's
 opening regime), but that requires a regime-classification step before the
 TCN buffer warms up. Open design question.
 
-### 2. Eval harness needs hooking
+### 3. Eval harness needs hooking
 
 `hpo.py` defines the Optuna study over `(η, γ_inv, terminal_mult)` with
 holdout validation, but the data-provider callables
@@ -452,7 +519,7 @@ stubs (see `IMPLEMENTATION.md §9`). Producing a real archived-mandate
 replay stream is a one-time write specific to whoever has the data lake —
 not hard, just unwritten.
 
-### 3. Replay session-boundary detection
+### 4. Replay session-boundary detection
 
 `test_replay.ReplaySensorArray` doesn't notice when the harvested CSV
 stitches across trading days; mid can jump 40%+ at a session join. Today

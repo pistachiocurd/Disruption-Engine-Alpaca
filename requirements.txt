@@ -11,6 +11,13 @@ pyarrow>=15.0.0
 torch>=2.2
 scikit-learn>=1.4.0
 
+# AUC-direct optimization for extreme class imbalance (Yuan et al. 2023).
+# Used by train_stream.py --loss aucm to escape the "predict near zero"
+# trivial minimum that point-wise BCE/Focal fall into at <1% positive
+# density on HL perp shock prediction. See P0 in TODO.md and §13.3 of
+# LAYER2_TRAINING.md.
+libauc>=1.4
+
 # Reinforcement learning environment
 gymnasium>=0.29
 

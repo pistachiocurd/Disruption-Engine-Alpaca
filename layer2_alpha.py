@@ -12,6 +12,7 @@ Components:
 from __future__ import annotations
 
 import logging
+import math
 import time
 from collections import deque
 from dataclasses import dataclass
@@ -26,6 +27,7 @@ from config import (
     BASE_EXECUTION_WINDOW,
     CAPTURE_RATIO,
     EPSILON,
+    EXCHANGE_ID,
     FD_DOMAIN_PCT,
     FD_STABILITY_FACTOR,
     LAMBDA_ATTRITION,
@@ -94,8 +96,13 @@ class TCNBlock(nn.Module):
 
 class TCNSpikePredictor(nn.Module):
     """
-    Input:  (batch, 3, 60) — [ce_ratio, obi, liquidation_rate] over 60 ticks.
+    Input:  (batch, C, 60) where C is TCN_INPUT_CHANNELS (3 for equities,
+            5 for Hyperliquid per Path D / §13.5 of LAYER2_TRAINING.md).
     Output: (batch,) — turbulence_index in (0, 1).
+
+    forward() returns sigmoided probabilities (for inference).
+    forward_logits() returns raw logits (for BCE/Focal/AUCM training paths
+    that expect logits — see train_stream.py).
     """
 
     def __init__(
@@ -113,14 +120,299 @@ class TCNSpikePredictor(nn.Module):
         self.head = nn.Linear(hidden_channels, 1)
         self.seq_len = seq_len
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: (B, C, T)
+    def forward_logits(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (B, C, T) → raw logits (B,)
         x = self.input_proj(x)
         for blk in self.blocks:
             x = blk(x)
         # Take the LAST timestep (causal, so it summarizes the full window).
         x_last = x[:, :, -1]
-        return torch.sigmoid(self.head(x_last)).squeeze(-1)
+        return self.head(x_last).squeeze(-1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return torch.sigmoid(self.forward_logits(x))
+
+
+# ============================================================================
+# Transformer Spike Predictor — Path C / P3.5 (2026-05-10)
+# ============================================================================
+class TransformerSpikePredictor(nn.Module):
+    """Causal Transformer encoder alternative to the TCN.
+
+    Path C / P3.5 tests whether the TCN's fixed-grid causal-conv inductive
+    bias is the remaining binding constraint after AUCM (Path A) and
+    crypto-native features (Path D) have addressed loss geometry and
+    feature inadequacy. Attention removes the dilation-equidistance
+    assumption and lets the model learn arbitrary token-to-token
+    relationships across the 60-tick window.
+
+    Drop-in shape compatibility with TCNSpikePredictor:
+        Input:  (B, C, T)  where C = TCN_INPUT_CHANNELS, T = TCN_INPUT_LENGTH
+        Output: (B,)       sigmoided probability via forward();
+                           raw logit via forward_logits().
+
+    Sized to roughly match TCN parameter count (~30K trainable). Tunable
+    via init args. Sinusoidal positional encoding is index-based — the
+    irregular cadence is exposed to the model through the existing
+    feature channels (mlofi/vamp/kyles_lambda already encode tick-rate
+    pressure indirectly via the Path D harvest). A future iteration
+    could add explicit Δt as a 6th input channel.
+
+    Causal mask: upper-triangular True (i.e. token i can attend only to
+    tokens ≤ i). Same no-future-leakage guarantee the TCN's causal conv
+    provides.
+    """
+
+    def __init__(
+        self,
+        in_channels: int = TCN_INPUT_CHANNELS,
+        d_model: int = TCN_HIDDEN_CHANNELS,
+        num_layers: int = 3,
+        nhead: int = 4,
+        dim_feedforward: int = 128,
+        seq_len: int = TCN_INPUT_LENGTH,
+        dropout: float = 0.0,
+    ) -> None:
+        super().__init__()
+        self.seq_len = seq_len
+        self.d_model = d_model
+        self.input_proj = nn.Linear(in_channels, d_model)
+        # Sinusoidal positional encoding; frozen.
+        self.register_buffer("pos_enc", self._sinusoidal_pe(seq_len, d_model))
+        # Upper-triangular causal mask: position i can attend to j ≤ i only.
+        # nn.TransformerEncoderLayer with is_causal=True interprets True = mask out.
+        causal_mask = torch.triu(
+            torch.ones(seq_len, seq_len, dtype=torch.bool), diagonal=1,
+        )
+        self.register_buffer("causal_mask", causal_mask)
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=d_model,
+            nhead=nhead,
+            dim_feedforward=dim_feedforward,
+            dropout=dropout,
+            activation="gelu",
+            batch_first=True,
+            norm_first=True,   # Pre-norm — more stable for small models at bf16
+        )
+        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        self.head = nn.Linear(d_model, 1)
+
+    @staticmethod
+    def _sinusoidal_pe(seq_len: int, d_model: int) -> torch.Tensor:
+        pe = torch.zeros(seq_len, d_model)
+        pos = torch.arange(0, seq_len, dtype=torch.float).unsqueeze(1)
+        div = torch.exp(
+            torch.arange(0, d_model, 2, dtype=torch.float)
+            * -(math.log(10000.0) / d_model)
+        )
+        pe[:, 0::2] = torch.sin(pos * div)
+        pe[:, 1::2] = torch.cos(pos * div)
+        return pe.unsqueeze(0)  # (1, T, d_model)
+
+    def forward_logits(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (B, C, T) → transpose to (B, T, C) for TransformerEncoder.
+        x = x.transpose(1, 2)
+        h = self.input_proj(x) + self.pos_enc[:, : x.size(1)]
+        h = self.encoder(h, mask=self.causal_mask, is_causal=True)
+        # Take the last token (causal — summarizes the full window).
+        return self.head(h[:, -1]).squeeze(-1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return torch.sigmoid(self.forward_logits(x))
+
+
+# ============================================================================
+# Mamba Spike Predictor — Path C / P3.5 (2026-05-11)
+# ============================================================================
+# Hand-rolled minimal Mamba (Gu & Dao 2023) in pure PyTorch. The official
+# mamba-ssm package requires a fused CUDA kernel build (nvcc + Python ≤3.12);
+# the dev environment is Python 3.14 + no nvcc + RTX 5070 Ti, so we
+# implement the selective scan directly. Slower per-step than the fused
+# kernel but mathematically identical and device-agnostic.
+#
+# The key innovation tested here: input-dependent dynamics. The model
+# computes per-tick step size Δ from the input, then evolves a hidden
+# state via h_t = exp(Δ_t · A) · h_{t-1} + Δ_t · B_t · x_t. Bursty data
+# with millisecond-irregular cadence is exactly the regime Mamba's
+# selection mechanism was designed for — vs. TCN's fixed dilation grid
+# and Transformer's index-based positional encoding.
+
+
+class MambaBlock(nn.Module):
+    """Single Mamba block: selective state-space scan with input-dependent Δ.
+
+    Structure (Gu & Dao 2023):
+      x → LayerNorm → Linear (split into x, z)
+      x → causal Conv1d → SiLU → SSM (with input-dep Δ, B, C) → gate by z
+        → Linear out → residual add
+
+    For numerical stability, the recurrent scan runs in fp32 even under
+    bf16 autocast (exp/softplus of large Δ underflows in bf16's small
+    mantissa).
+    """
+
+    def __init__(
+        self,
+        d_model: int,
+        d_state: int = 16,
+        d_conv: int = 4,
+        expand: int = 2,
+        dt_rank: Optional[int] = None,
+    ) -> None:
+        super().__init__()
+        self.d_model = d_model
+        self.d_state = d_state
+        self.d_conv = d_conv
+        self.d_inner = expand * d_model
+        self.dt_rank = math.ceil(d_model / 16) if dt_rank is None else dt_rank
+
+        self.norm = nn.LayerNorm(d_model)
+        self.in_proj = nn.Linear(d_model, 2 * self.d_inner, bias=False)
+
+        # Causal depthwise Conv1d on the inner channel — short-range context
+        # before the selective scan. Pad d_conv-1 on each side, trim to L.
+        self.conv1d = nn.Conv1d(
+            in_channels=self.d_inner,
+            out_channels=self.d_inner,
+            kernel_size=d_conv,
+            groups=self.d_inner,
+            padding=d_conv - 1,
+            bias=True,
+        )
+
+        # x → [Δ_raw, B, C] projection
+        self.x_proj = nn.Linear(
+            self.d_inner, self.dt_rank + 2 * d_state, bias=False,
+        )
+        # Δ_raw → Δ projection (bias init so softplus(0) gives ~1)
+        self.dt_proj = nn.Linear(self.dt_rank, self.d_inner, bias=True)
+        nn.init.uniform_(self.dt_proj.weight, -0.1, 0.1)
+        # Initialize dt_proj bias so initial Δ ≈ 1 (softplus(0.541) ≈ 1)
+        with torch.no_grad():
+            self.dt_proj.bias.fill_(math.log(math.expm1(1.0)))
+
+        # State-space matrix A (initialized as -arange(1, d_state+1) per row)
+        A = torch.arange(1, d_state + 1, dtype=torch.float32).repeat(self.d_inner, 1)
+        self.A_log = nn.Parameter(torch.log(A))
+        # Skip-connection scalar D
+        self.D = nn.Parameter(torch.ones(self.d_inner))
+
+        self.out_proj = nn.Linear(self.d_inner, d_model, bias=False)
+
+    def forward(self, h: torch.Tensor) -> torch.Tensor:
+        """h: (B, L, d_model) → (B, L, d_model). Residual added by caller."""
+        B, L, _ = h.shape
+        residual = h
+        h = self.norm(h)
+
+        xz = self.in_proj(h)  # (B, L, 2*d_inner)
+        x, z = xz.chunk(2, dim=-1)
+
+        # Causal Conv1d
+        x = x.transpose(1, 2)  # (B, d_inner, L)
+        x = self.conv1d(x)[:, :, :L]  # trim right-padding → causal
+        x = x.transpose(1, 2)  # (B, L, d_inner)
+        x = F.silu(x)
+
+        # Selective scan (fp32 for stability)
+        y = self._selective_scan(x)
+
+        # Gate by z, project out
+        y = y * F.silu(z)
+        out = self.out_proj(y)
+        return residual + out
+
+    def _selective_scan(self, x: torch.Tensor) -> torch.Tensor:
+        """Recurrent selective scan in fp32.
+
+        x: (B, L, d_inner)
+        Returns: (B, L, d_inner)
+        """
+        orig_dtype = x.dtype
+        x = x.float()
+
+        B, L, _ = x.shape
+        d_inner, d_state = self.d_inner, self.d_state
+
+        # Compute input-dependent Δ, B, C
+        x_dbl = self.x_proj(x)  # (B, L, dt_rank + 2*d_state)
+        delta_raw, B_param, C_param = torch.split(
+            x_dbl, [self.dt_rank, d_state, d_state], dim=-1,
+        )
+        delta = F.softplus(self.dt_proj(delta_raw))  # (B, L, d_inner)
+
+        # Discretize A and B using Δ
+        # A: (d_inner, d_state)
+        # delta: (B, L, d_inner)
+        A = -torch.exp(self.A_log.float())
+        deltaA = torch.exp(delta.unsqueeze(-1) * A)  # (B, L, d_inner, d_state)
+        deltaB_u = (
+            delta.unsqueeze(-1) * B_param.unsqueeze(2) * x.unsqueeze(-1)
+        )  # (B, L, d_inner, d_state)
+
+        # Recurrent scan
+        h = torch.zeros(B, d_inner, d_state, device=x.device, dtype=x.dtype)
+        ys = []
+        for i in range(L):
+            h = deltaA[:, i] * h + deltaB_u[:, i]
+            y_i = (C_param[:, i].unsqueeze(1) * h).sum(-1)  # (B, d_inner)
+            ys.append(y_i)
+        y = torch.stack(ys, dim=1)  # (B, L, d_inner)
+
+        # Skip-connection D
+        y = y + x * self.D
+
+        return y.to(orig_dtype)
+
+
+class MambaSpikePredictor(nn.Module):
+    """Mamba (selective state-space) model for spike prediction.
+
+    Tests the H2 hypothesis from `tcn-failure-investigation.md`: TCN's
+    fixed-grid inductive bias is the binding constraint after H4 (loss
+    geometry, Path A) and H3 (feature set, Path D) are addressed.
+
+    Drop-in shape compatibility with TCN/Transformer predictors:
+        Input:  (B, C, T)   C = TCN_INPUT_CHANNELS
+        Output: (B,)        forward() = sigmoid(forward_logits())
+
+    Default sizing aims for parameter parity with TCN (~30K). Use
+    --model mamba in train_stream.py.
+    """
+
+    def __init__(
+        self,
+        in_channels: int = TCN_INPUT_CHANNELS,
+        d_model: int = TCN_HIDDEN_CHANNELS,
+        num_layers: int = 3,
+        d_state: int = 16,
+        d_conv: int = 4,
+        expand: int = 2,
+        seq_len: int = TCN_INPUT_LENGTH,
+    ) -> None:
+        super().__init__()
+        self.seq_len = seq_len
+        self.input_proj = nn.Linear(in_channels, d_model)
+        self.blocks = nn.ModuleList([
+            MambaBlock(
+                d_model=d_model, d_state=d_state, d_conv=d_conv, expand=expand,
+            )
+            for _ in range(num_layers)
+        ])
+        self.norm_out = nn.LayerNorm(d_model)
+        self.head = nn.Linear(d_model, 1)
+
+    def forward_logits(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (B, C, T) → (B, T, C)
+        x = x.transpose(1, 2)
+        h = self.input_proj(x)
+        for block in self.blocks:
+            h = block(h)  # residual added inside block
+        h = self.norm_out(h)
+        return self.head(h[:, -1]).squeeze(-1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return torch.sigmoid(self.forward_logits(x))
 
 
 # ============================================================================
@@ -310,14 +602,23 @@ class AlphaEngine:
         self.decision_log.append(rec)
 
     def _push_features(self, physics_state) -> None:
-        # ce_ratio scaled to match train_stream.py:101-105 preprocessing — without
-        # this, weights trained on ce_ratio/10 see 10× larger inputs at inference
-        # and the sigmoid output collapses to ~0.
-        feats = np.array([
-            physics_state.ce_ratio / 10.0,
-            physics_state.obi,
-            physics_state.liquidation_rate,
-        ], dtype=np.float32)
+        # Feature scaling MUST match train_stream.py so trained weights and
+        # live inputs share scale. Path D (P3.6 / §13.4) — Hyperliquid uses
+        # 5 crypto-native channels; everything else keeps the original 3.
+        if EXCHANGE_ID == "hyperliquid":
+            feats = np.array([
+                physics_state.ce_ratio / 10.0,
+                physics_state.obi,
+                physics_state.mlofi,
+                physics_state.vamp / 10.0,
+                physics_state.kyles_lambda * 100.0,
+            ], dtype=np.float32)
+        else:
+            feats = np.array([
+                physics_state.ce_ratio / 10.0,
+                physics_state.obi,
+                physics_state.liquidation_rate,
+            ], dtype=np.float32)
         self._buffer.append(feats)
 
     def _tcn_predict(self) -> float:

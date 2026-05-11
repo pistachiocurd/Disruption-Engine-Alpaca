@@ -89,6 +89,12 @@ def build_labels(data: dict) -> tuple[np.ndarray, list]:
     """
     For each tick t, label = 1 iff a shock event starts within the next
     MAX_DIFFUSION_TICKS ticks. Returns (labels[N], events).
+
+    If `config.USE_VOL_SCALED_LABELS` is True AND the data has a `D_c`
+    column (Path G's rolling realized variance from the extended
+    FeatureDumper schema), the shock trigger uses k-sigma absolute moves
+    rather than the fixed SHOCK_PRICE_MOVE_PCT relative-move trigger.
+    See LAYER2_TRAINING.md §13.14 for the motivation.
     """
     n = len(data["timestamp_ms"])
     ob_snapshots = [
@@ -101,7 +107,17 @@ def build_labels(data: dict) -> tuple[np.ndarray, list]:
     ]
     vpin_series = data["vpin"].tolist()
 
-    events = identify_shock_events(ob_snapshots, vpin_series)
+    D_c_series = None
+    if config.USE_VOL_SCALED_LABELS and "D_c" in data:
+        D_c_series = data["D_c"].tolist()
+
+    events = identify_shock_events(
+        ob_snapshots,
+        vpin_series,
+        D_c_series=D_c_series,
+        k_sigma=config.SHOCK_K_SIGMA,
+        min_pct_floor=config.SHOCK_MIN_PCT_FLOOR,
+    )
     #print(f"identify_shock_events found {len(events)} shock events.")
     #if len(events) < 5:
         #print(

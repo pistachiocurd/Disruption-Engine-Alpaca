@@ -1,0 +1,13 @@
+{
+  "threshold": 0.05,
+  "precision": 0.013983450389400902,
+  "recall": 0.9986863629603926,
+  "f1": 0.027580719849509515,
+  "criterion": "fbeta",
+  "beta": 2.0,
+  "sweep_source": "train",
+  "sweep_csv_path": "calibration\\feature_history_BTC.csv,calibration\\feature_history_ETH.csv,calibration\\feature_history_SOL.csv,calibration\\feature_history_HYPE.csv",
+  "sweep_n_predictions": 8666733,
+  "sweep_n_positives": 121038,
+  "fallback": false
+}

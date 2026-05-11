@@ -701,6 +701,269 @@ The dominant constraint on HL is positive-label *count*, not density and
 not feature concentration. Combined fixes (multi-coin + liquidation
 channel + 14-21 day harvest) target this directly.
 
+## 14. Pivot to directional bias prediction — L2 features carry real alpha (2026-05-12)
+
+### 14.1 Temporal integrity check — §13.4 baseline was modestly inflated
+
+§13 closed at F2 ≈ 0.121 (§13.4 multi-coin AUCM with Path D features),
+with six independent refinement strategies failing to lift the score
+(§13.6 through §13.15). Before declaring the data ceiling fundamental,
+ran a temporal-holdout integrity check: same §13.4 protocol but with
+each coin's CSV time-split 80/20 (train on first 80% of BTC/ETH/SOL,
+val on held-out last 20%). Result: **val F2 = 0.106** at thr=0.050,
+max prec 1.5× base (vs §13.4's reported 1.81×). The original baseline
+was ~12% inflated by training-only F2 reporting, but the ceiling
+itself is real at F2 ≈ 0.10-0.11.
+
+Also ran the same protocol BTC-only (per-symbol pivot test, time-split):
+**val F2 = 0.062 with AUCM (volume-starved, warning fired), 0.061 with
+Focal.** Per-symbol training underperforms pooled — cross-coin pooling
+provides a regularization benefit single-coin can't replicate at this
+data volume. **Pivot 1 (per-symbol models) is OFF the table.**
+
+### 14.2 The reframe — directional bias as a balanced target
+
+The §13 investigation had been trying to push shock-prediction F2 from
+0.10 → 0.20+ across:
+- Loss function changes (AUCM, Focal, BCE)
+- Feature engineering (Path D, Path G dimensionless)
+- Label refinement (windows, vol-scaled, hybrid floor)
+- Architecture (Path C swap, Path E SSL pretrain)
+
+Every refinement was implicitly assuming **shocks** were the right
+prediction target. The shock target has two structural problems:
+
+1. **Class imbalance**: ~1.4% positive density forces AUCM, Focal,
+   or pos-weighted BCE — each with its own pathology.
+2. **Sparse, noisy events**: a "shock" is defined by a downstream
+   heuristic (VPIN + price move + window), so labels themselves carry
+   information loss before the network even sees them.
+
+The directional target sidesteps both: `label[t] = 1 iff mid[t+H] > mid[t]`
+is balanced ~50/50 (positive density 44.4% on the held-out val) and is
+defined without any auxiliary signals. Asks the most fundamental
+question: **does the 50ms state vector contain leading information
+about price direction over a tradeable horizon?**
+
+### 14.3 Implementation
+
+Added in this session:
+
+1. `config.py`: `TCN_DIRECTIONAL_HORIZON_TICKS = 100` (~55s on HL's
+   ~1.8 ticks/s — well past the spread-roundtrip timescale).
+2. `train_stream.py`: new `--label-source=directional` variant.
+   `label[t] = 1 iff mid[t+H] > mid[t]`; last H ticks padded with 0
+   (negligible bias since H << n).
+3. `train_stream.py`: new `--bce-pos-weight` flag (default 10.0 for
+   back-compat with shock training; set to 1.0 for balanced
+   directional target).
+
+### 14.4 Results — features carry real leading signal
+
+Protocol: 3-coin pool (BTC/ETH/SOL × 14 days), 80/20 time-split per
+coin, train on `feature_history_<COIN>.train.csv`, val on pooled
+`feature_history_pooled.val.csv` (1.3M held-out ticks). Path D feature
+set (5 channels). BCE loss, `pos_weight=1.0`, lr=1e-3, batch 2048,
+1 epoch.
+
+Val threshold sweep:
+
+| thr | pred_pos | precision | edge vs 0.444 base |
+|---:|---:|---:|---:|
+| 0.35 | 1.09M (84%) | 0.461 | +1.7pp |
+| 0.40 | 697K (54%) | 0.498 | +5.4pp |
+| **0.45** | **367K (28%)** | **0.544** | **+10.0pp** |
+| **0.50** | **28K (2.2%)** | **0.555** | **+11.1pp** |
+| 0.55 | 77 | 0.506 | +6.2pp |
+| 0.70 | 14 | 0.643 | +20pp (small N) |
+| 0.85 | 5 | 0.800 | +36pp (small N) |
+
+**The 0.45 row is the headline result.** 28% of val ticks predicted UP
+with 54.4% accuracy on N=367K = +10pp edge over the 0.444 base rate,
+N large enough to be statistically rock-solid. The 0.50 row is
+sharper at 55.5% but on only N=28K (2.2% of val). Higher thresholds
+suggest the model has a small "high-confidence" tail it can flag with
+56-80% precision but only on ~5-15 predictions out of 1.3M — actionable
+only if the cost-of-trade-entry is very low.
+
+### 14.5 Implications for the whole investigation
+
+**The §13 "data ceiling" was a target-design artifact, not a feature
+limitation.** The same Path D feature vector that capped at F2 ≈ 0.11
+for shock prediction produces a 1.25× lift on directional prediction
+— a fundamentally more usable signal density. Three corollaries:
+
+1. **All six §13 refinements (loss, architecture, features, labels)
+   were correctly noting that shock-target rescue wasn't working**, but
+   each was reaching for a partial fix when the target itself was the
+   structural issue.
+2. **L3 order book data (Pivot 3) is NOT required.** We have alpha at
+   L2 once the target is appropriate.
+3. **The HMM-based regime target (Pivot 2 Option A/B) was correctly
+   abandoned.** With the HMM 98% stuck on regime 2 for BTC/ETH, no
+   refit short of a full re-calibration would have lifted it.
+
+### 14.6 Decision — directional is the new training target
+
+§13's shock-prediction architecture is preserved (for incident
+detection / circuit-breaker use cases where a binary "did a shock just
+start?" label is operationally meaningful), but the **primary alpha
+generator** for the arbitrage engine becomes directional prediction.
+
+Forward work (§14.7 and beyond):
+- Translate the directional signal into a tradeable threshold (e.g.,
+  enter long on signal > 0.50 + half-spread cost; exit at signal
+  reversal or H ticks elapsed).
+- Tune `H` — test 50 / 100 / 200 / 500 to find the horizon with the
+  cleanest precision lift vs cost-of-execution.
+- Multi-epoch training (current is 1 epoch). The 0.69 train loss
+  barely budged across batches — significant headroom for further
+  optimization.
+- AlphaEngine wire-up: replace the shock-classifier threshold gate
+  with a directional-confidence gate. The current PhysicsState ↔
+  TCN flow continues; only the label interpretation changes.
+
+**Logs and artifacts.** `bce_directional_H100.log` (pos_weight=10,
+predict-all calibration), `bce_directional_H100_balanced.log`
+(pos_weight=1.0, the canonical result). `tcn_weights_BTC_USDC_USDC.pt`
+now reflects the directional model — must be regenerated under
+shock-labels protocol before any §13 shock-prediction reproduction.
+
+### 14.7 Phase A backtest — L2 directional alpha is REAL but UNEXECUTABLE (2026-05-12)
+
+§14.6 deferred the question of whether the +10pp paper edge would
+survive translation into a live execution mandate. Built
+`backtest_directional.py` as a standalone PnL simulator to answer this
+before committing to a multi-layer architectural refactor (the
+proposed `DirectionalMandate` + `MakerExecutor` rewiring of
+layer2_alpha.py / layer3_execution.py / engine.py).
+
+**Trading rule.** Maker-only entry: signal > long_threshold → post
+passive bid at best_bid[t]; signal < short_threshold → post passive ask
+at best_ask[t]. Taker exit at submit_t + H ticks (sell at bid for
+longs; lift ask for shorts).
+
+**Fill models.** Two are implemented, controlled by `--queue-fill-prob`:
+- *Strict adverse-selection (default)*: fill iff best_bid drops below
+  entry within H (market swept through our level — winner's curse
+  proxy). Strictest possible.
+- *Queue-priority (q > 0)*: with probability q, additionally fill
+  "neutrally" at a random tick in [t+1, t+H]. Models the fraction of
+  real-world maker fills that happen without adverse movement.
+
+**Seven runs across the configuration space:**
+
+| run | weights | hold | thr / dual | q | trades | gross_pnl | net_pnl |
+|---|---|---:|---|---:|---:|---:|---:|
+| 0  | H=100 | 100 | 0.55 / 0.45 | 0.0 | 524K | -$1.84M | -$5.76M |
+| A  | H=100 | 100 | 0.70 / 0.30 | 0.0 | 285 | -$1,665 | -$6,738 |
+| C  | H=100 | 100 | 0.53 / 0.43 | 0.0 | 428K | -$1.49M | -$4.69M |
+| B  | H=100 | 100 | 0.70 / 0.30 | 0.3 | 308 | -$727 | -$6,303 |
+| B' | H=100 | 100 | 0.70 / 0.30 | 1.0 | 360 | **+$1,203** | -$5,423 |
+| 1  | H=100 | **500** | 0.70 / 0.30 | 0.3 | 330 | **+$2,163** | -$3,911 |
+| 2b | **H=500** | 500 | 0.70 / 0.30 | 0.3 | 69 | +$126 | -$1,102 |
+
+**Three definitive conclusions:**
+
+1. **L2 features predict H=100 direction (real, ~55% paper precision);
+   they do NOT predict H=500 direction.** Run 2 retrained the model
+   at H=500 horizon — val sweep showed precision *at base rate
+   everywhere* and *dropping below* base rate at high-confidence
+   thresholds (thr=0.60 → prec=0.380 vs base 0.479). The
+   microstructure signal in the Path D feature set decays past
+   ~100 ticks.
+
+2. **The H=100 directional edge magnitude is far too small for
+   maker+taker execution.** Run B' with zero adverse selection
+   (q=1.0) gave gross +$1,203 across 360 best-confidence trades on
+   ~$20M notional = **+0.06 bps per trade**. The round-trip cost
+   (1 bp rebate − 4.5 bp taker fee = -3.5 bps net) eats this **58×**.
+   No threshold tuning, no fill-model relaxation, no longer hold
+   horizon, no architectural change can rescue an edge this small.
+
+3. **Run 1's H=500-OOD-hold improvement was random walk variance,
+   not signal.** The H=100-trained model evaluated at H=500 hold
+   gave gross +$2,163, but Run 2b (correctly trained at H=500) gave
+   only gross +$126 on equivalent high-confidence signals — a 17×
+   gap that's pure variance from giving moves more time.
+   Longer holds don't extend the model's predictive horizon; they
+   just let variance create more wins on the same flat distribution.
+
+### 14.8 L2 chapter closed; Pivot 3 (L3 microstructure) is the next direction (2026-05-12)
+
+The Phase A backtest closes the L2 investigation definitively.
+Three exhaustively tested framings — shock prediction (§13), regime
+classification (§14.2 scoping), directional prediction (§14.4-7) —
+all converge on the same physical fact: **the Path D feature set
+(ce_ratio, obi, mlofi, vamp, kyles_lambda) carries real but
+*magnitude-insufficient* leading signal**. The paper accuracy of
+55% on directional H=100 is genuine and consistent across both
+in-sample and temporally-held-out evaluation, but the *fraction of
+those wins where price moved more than the round-trip execution cost*
+is too small to survive any reasonable fee structure.
+
+**Why Path A (inventory framework) was considered and rejected.**
+A market-making framework with passive bids on both sides, no taker
+exit, and inventory accumulation could capture the full ~2 bps
+round-trip maker rebate, dwarfing the 0.06 bps directional edge.
+But that strategy IS the rebate; the TCN becomes window-dressing for
+marginal inventory skew. We would no longer be building a
+"disruption arbitrage engine" but a high-frequency rebate-farming
+bot, competing directly with FPGA market makers on queue priority.
+That's an infrastructure-and-latency contest, not a predictive-ML
+contest. Outside the project's thesis.
+
+**Why Path B (L3 / order-by-order data) is the correct pivot.**
+The fundamental problem with L2 aggregates is they *destroy* the
+microstructure dynamics that *precede* shocks: queue depletion,
+cancellation velocity, order lifespan, hidden-order inference,
+trade-aggressor sequence. L2 is a snapshot of the book state; L3 is
+the event-by-event tape of *how the book is being made*. The signal
+that drives professional HFT alpha (and that academic limit-order-book
+literature consistently finds predictive — see Cont & Kukanov 2017,
+Gould-Porter-Williams-McDonald-Fenn-Howison 2013) lives at L3, not L2.
+Path G's `BOUNDARY_CONDITIONS.md` already noted that the discrete
+quantum of market data is the order-event, not the snapshot.
+
+**What Pivot 3 requires.**
+
+1. **L3 data source.** Hyperliquid's S3 archive (which we already pull
+   for trades + L2 snapshots) is L2-only as far as we've verified.
+   Either: (a) find an L3-emitting venue with a public archive (Binance
+   tick data via S3, Coinbase Advanced order-by-order, Polygon options
+   tape, Databento for futures); (b) reconstruct L3 from HL's "delta"
+   stream if accessible; (c) commit to live L3 capture from the WS
+   feed forward.
+2. **New sensor architecture in `layer1_sensors.py`.** The current
+   sensors (VPIN, MLOFI, Kyle's λ) consume snapshots. L3 sensors need
+   to consume *order events*: order arrivals, cancellations, modifies,
+   trades-against-resting-orders. New characteristic quantities
+   include cancellation rate per side, order lifespan distribution,
+   queue position evolution, hidden-order inference from price
+   improvement events.
+3. **Replacement TCN feature stack.** Path D's 5 channels go away or
+   become a small subset. New channels are L3-derived. `TCN_INPUT_CHANNELS`
+   will need to grow substantially (likely 10-20 channels).
+4. **§13 / §14 calibration carries over conceptually but the labels
+   need re-derivation.** Shock-trigger definitions assumed L2 snapshots
+   (VPIN spike + N-tick price move). L3 may support better labels —
+   e.g., "did the book *thin* before the move?" — which were not
+   reconstructible from L2 alone.
+
+**Status of the L2 codebase.** Preserved as-is for reproducibility
+and as the reference baseline (anything L3 builds must beat
+F2 = 0.106 / max-prec = 1.5× base rate / directional gross edge
+0.06 bps per trade — the L2 ceilings). `USE_PATH_G_FEATURES`,
+`USE_VOL_SCALED_LABELS`, the directional `label_source`, and
+`backtest_directional.py` all remain wired up in case future work
+revisits a hybrid L2+L3 feature stack. The `tcn_weights_*.pt` files
+freeze the current model state; the H=100 directional weights are
+preserved at `tcn_weights_BTC_USDC_USDC_H100.pt`.
+
+**L2 investigation is formally complete.** §15 and beyond belong to L3.
+
+---
+
 ## 13. Hyperliquid liquidation channel and multi-coin training (2026-05-10)
 
 Two infrastructure additions to address the HL TCN training plateau:
@@ -846,3 +1109,1149 @@ Full experiment progression on HL perps, in order:
 Dedicated research session planned (see plan file
 `~/.claude/plans/tcn-failure-investigation.md`) to characterize the
 root cause more rigorously than this progression of ad-hoc experiments.
+
+### 13.4 AUCM loss breakthrough (2026-05-10)
+
+The dedicated research session (above) ingested Gemini Deep Research on
+TCN failure modes, which diagnosed §13.3's pathology — "predict-all
+below thr=0.15, base-rate prec at thr=0.20, predict-nothing above
+thr=0.25" — as the canonical signature of point-wise loss collapse under
+extreme class imbalance (<1% positive density). The model converges to
+"predict near zero everywhere" because the flat basin around base-rate
+mathematically dominates the gradient signal from rare positives.
+
+The recommended remediation: replace BCE/Focal with LibAUC's `AUCMLoss`
+(pairwise AUC-margin) paired with the PESG optimizer (minimax inner
+loop). AUCM optimizes the **rank** of positive vs. negative scores,
+making the base-rate trivial minimum mathematically irrelevant — the loss
+penalizes only when a negative outscores a positive.
+
+**Implementation (2026-05-10):**
+
+- Added `libauc>=1.4` to `requirements.txt`.
+- `train_stream.py` gained `--loss aucm` alongside `bce`/`focal`, with
+  the PESG optimizer when selected; pre-loss `sigmoid()` to feed AUCM
+  probabilities; `--aucm-margin` and `--aucm-lr` flags.
+- **Initial run failed silently** — AUCM produced loss=0 on ~95% of
+  batches because shock labels cluster (H consecutive positives per
+  shock event) and the streaming temporal-order pipeline yielded
+  zero-positive batches. LibAUC emitted `UserWarning: Input data has
+  no positive sample!`.
+- **Fix:** added `ShuffledBufferDataset` — reservoir-style 500K-sample
+  buffer applied only when `--loss=aucm`. Each 2048-batch then contains
+  ~48 positives ± 7 (σ from binomial); P(zero-positive batch) ≈ 10⁻²¹.
+  DualSampler proper requires a map-style dataset; this is the cheapest
+  equivalent for streaming IterableDataset.
+
+**Result — 7d × 3-coin, shock labels, AUCM, 1 epoch, PESG lr=0.01:**
+
+| Threshold | pred_pos | TP | FP | FN | prec | rec | F1 | F2 |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 0.05 | 1,112,205 | 28,953 | 1,083,252 | 47,836 | 0.026 | 0.377 | 0.049 | **0.102** ← chosen |
+| 0.10 | 514,046 | 14,600 | 499,446 | 62,189 | 0.028 | 0.190 | 0.049 | 0.088 |
+| 0.15 | 356,752 | 10,798 | 345,954 | 65,991 | 0.030 | 0.141 | 0.050 | 0.081 |
+| 0.20 | 244,191 | 7,828 | 236,363 | 68,961 | 0.032 | 0.102 | 0.049 | 0.071 |
+| 0.25 | 156,745 | 5,229 | 151,516 | 71,560 | 0.033 | 0.068 | 0.045 | 0.056 |
+| 0.30 | 86,340 | 3,108 | 83,232 | 73,681 | 0.036 | 0.040 | 0.038 | 0.040 |
+| 0.35 | 34,047 | 1,329 | 32,718 | 75,460 | 0.039 | 0.017 | 0.024 | 0.020 |
+| 0.40 | 6,914 | 278 | 6,636 | 76,511 | 0.040 | 0.004 | 0.007 | 0.005 |
+
+**What's confirmed:**
+
+- **Hypothesis #4 (loss-function geometric degeneracy) was real and
+  contributory.** The §13.3 threshold-sweep cliff is gone — precision
+  climbs smoothly and monotonically from 0.026 → 0.040 as threshold
+  rises; pred_pos varies smoothly across the sweep range; no
+  predict-everything floor or predict-nothing cliff. This is the
+  fingerprint of a working ranker, not a collapsed classifier.
+- **F2 = 0.102, up from §13.3's 0.046 (2.2× improvement).** Success
+  criterion (F2 ≥ 0.10 with non-degenerate sweep curve) met.
+
+**What's NOT yet resolved:**
+
+- **Signal extraction is still weak.** Max precision in the sweep is
+  0.040 = 1.67× the base rate of 0.024. TSLA-equity for comparison
+  reached precision > 0.5 at high thresholds. The model now extracts a
+  ranking but it's a weak one.
+- **Hypothesis #4 was necessary but not sufficient.** The remaining gap
+  is plausibly H2 (architecture-cadence mismatch) or H3 (feature set
+  inadequate).
+
+**Forward pointer:** Path D (P3.6 in TODO.md) — crypto-native features.
+Replace the dead `liquidation_rate` channel and the weak `ce_ratio`
+contribution with MLOFI (multi-level OFI, top 5–10 levels), VAMP
+(volume-adjusted mid price), and Kyle's λ (rolling regression of
+return on signed volume). With AUCM proving the model CAN extract weak
+rank, richer features should let it extract stronger rank without
+further architecture changes (H2 deferred to P3.5).
+
+**Artifacts (in `calibration/`):**
+`tcn_weights_BTC_USDC_USDC.pt`,
+`tcn_threshold_BTC_USDC_USDC.json` (thr=0.05, F2=0.102),
+`tcn_threshold_sweep_BTC_USDC_USDC.csv`.
+
+Path A artifacts preserved alongside the re-harvested Path D CSVs as
+`feature_history_<COIN>.pathA.csv` (~98 MB each) for direct A/D diff.
+
+### 13.5 Path D — crypto-native features (2026-05-10)
+
+Path A confirmed loss geometry (H4) was a contributor but not sufficient.
+Path D replaces the dead `liquidation_rate` channel and weak `ce_ratio`
+contribution with three crypto-native features added to the SensorArray:
+
+- **MLOFI** (Multi-Level OFI, Xu et al. 2018) — per-snapshot signed
+  flow across the top-5 book levels, normalized by total top-K depth.
+  Captures bid/ask pressure beyond top-of-book OBI; less susceptible
+  to spoofing because deeper levels are harder to fake.
+- **VAMP** (Volume-Adjusted Mid, Stoikov 2018) — queue-position-weighted
+  mid expressed as basis-point deviation from arithmetic mid. A heavy
+  ask queue pulls VAMP toward the bid (sell-side pressure expected).
+- **Kyle's λ** — rolling 100-tick OLS regression of mid-return on
+  normalized signed trade volume. Higher λ = thinner book / more
+  price-impact-per-unit-flow.
+
+**Implementation (this session, 2026-05-10):**
+
+- New sensor classes `MLOFITracker`, `VAMPDeviationComputer`,
+  `KylesLambdaTracker` in `layer1_sensors.py`, hooked into
+  `SensorArray._process_order_book` and `_process_trade`. Equity path
+  unaffected (no L2 depth from Alpaca, no per-trade initiator field).
+- `PhysicsState` gained `mlofi`, `vamp`, `kyles_lambda` fields.
+  `FeatureDumper` extended to write three new CSV columns.
+- `config.TCN_INPUT_CHANNELS` made conditional: 5 if
+  `EXCHANGE_ID=="hyperliquid"`, else 3. Equity weights unaffected.
+- `train_stream.py` and `AlphaEngine._push_features` mirror conditional
+  5-channel stacking: `[ce_ratio/10, obi, mlofi, vamp/10, kyles_lambda*100]`.
+- `ReplaySensorArray` reads new columns with `.get(col, 0.0)` so old
+  equity CSVs still replay cleanly. All 5 replay tests pass.
+- 7d × 3-coin (BTC+ETH+SOL) re-harvested with the new sensors writing
+  the 12-column schema. ~3 hours wall, $1 S3, 6.54M rows total.
+
+**Result — 7d × 3-coin, shock labels, AUCM, 1 epoch, PESG lr=0.01:**
+
+| Threshold | pred_pos | TP | FP | FN | prec | rec | F1 | F2 |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 0.05 | 2,337,581 | 65,486 | 2,272,095 | 25,141 | 0.028 | 0.723 | 0.054 | **0.121** ← chosen |
+| 0.10 | 575,479 | 18,496 | 556,983 | 72,131 | 0.032 | 0.204 | 0.056 | 0.098 |
+| 0.15 | 368,284 | 12,673 | 355,611 | 77,954 | 0.034 | 0.140 | 0.055 | 0.086 |
+| 0.20 | 218,687 | 8,306 | 210,381 | 82,321 | 0.038 | 0.092 | 0.054 | 0.072 |
+| 0.25 | 106,529 | 4,516 | 102,013 | 86,111 | 0.042 | 0.050 | 0.046 | 0.048 |
+| 0.30 | 41,053 | 2,060 | 38,993 | 88,567 | 0.050 | 0.023 | 0.031 | 0.026 |
+| 0.35 | 12,009 | 582 | 11,427 | 90,045 | 0.048 | 0.006 | 0.011 | 0.007 |
+| 0.40 | 1,499 | 39 | 1,460 | 90,588 | 0.026 | 0.000 | 0.001 | 0.000 |
+
+**What improved (Path D vs Path A):**
+
+| Metric | Path A | Path D | Δ |
+|---|---:|---:|---:|
+| F2 (chosen op point) | 0.102 | **0.121** | **+18%** |
+| Max precision in sweep | 0.040 (@ thr=0.40) | **0.050** (@ thr=0.30) | **+25%** |
+| Max-prec ÷ base rate | 1.70× | **1.81×** | +6% rel |
+| Recall at thr=0.05 | 0.377 | **0.723** | +92% |
+| Positive density (label rate) | 2.35% | 2.77% | +18% |
+| Re-harvest cost | — | $1, ~3h | — |
+
+Notes:
+- The +18% positive-density change comes from the re-harvest hitting
+  a slightly different date window (HL archive is ~35 days lagged;
+  the two harvests targeted overlapping but not identical days). Part
+  of the F2 lift is explained by this base-rate shift; the
+  base-rate-adjusted improvement (max-prec ÷ base rate) is +6% rel.
+- The most striking change is **recall at low thresholds**: 0.377 →
+  0.723 at thr=0.05. The model now produces high scores for a much
+  larger fraction of true positives — it's *more confident* on
+  positives without losing too much precision. This is the new
+  features paying their way.
+- Sweep curve remains non-degenerate. Precision climbs monotonically
+  0.028 → 0.050 from thr=0.05 to thr=0.30 (vs Path A's 0.026 → 0.040
+  over a similar range). The H4-collapse failure mode is fully gone.
+
+**What's NOT yet resolved:**
+
+- Max precision is still only **1.81× the base rate**. TSLA-equity
+  reached >20× base rate. Crypto-native features carry signal but
+  the model isn't extracting it strongly enough.
+- Loss trajectory within epoch 1 peaked at batch ~1500 then came
+  back down (different shape from Path A's monotone rise + plateau).
+  More epochs might help; or the architecture is genuinely the
+  remaining bottleneck.
+
+**Forward pointer.** Two candidates for the next move:
+
+1. **P3.5 / Path C** — replace the fixed-grid TCN with Mamba or
+   Neural CDE. Mamba's input-dependent step size is designed for
+   exactly the millisecond-irregular bursty cadence HL data exhibits.
+   Higher leverage if the remaining gap is architectural (H2).
+2. **P3.7 / Path E** — SSL pretext pretraining on next-tick OBI/mid
+   prediction, then fine-tune the classification head on shock
+   labels with AUCM. Higher leverage if the gap is label noise (H5).
+
+Path C is the higher-likelihood bet given that Path A + D have already
+addressed H4 and H3, leaving H2 (cadence) as the most plausible
+unfixed contributor.
+
+**Artifacts (in `calibration/`):**
+`tcn_weights_BTC_USDC_USDC.pt` (5-channel, Path D),
+`tcn_threshold_BTC_USDC_USDC.json` (thr=0.05, F2=0.121),
+`tcn_threshold_sweep_BTC_USDC_USDC.csv`.
+`feature_history_<COIN>.csv` — fresh 12-column 7d × 3-coin harvest.
+`feature_history_<COIN>.pathA.csv` — 9-column Path A baseline data.
+
+### 13.6 Path C — architecture swap (2026-05-11) — TESTED NEGATIVE
+
+After Path A (loss, H4) and Path D (features, H3) lifted F2 from 0.046
+→ 0.121, the next hypothesis was H2: TCN's fixed-grid causal-conv
+inductive bias is the binding constraint for HL's millisecond-irregular
+bursty cadence. The DR recommended Mamba (input-dependent selective
+scan) or Neural CDE (continuous-time splines) as the fix.
+
+**Install constraints.** Bleeding-edge dev environment:
+- Python 3.14.4 — too new for `mamba-ssm` wheels (latest supports ≤3.12).
+- No `nvcc` in PATH — can't compile mamba's fused CUDA kernel from source.
+- PyTorch 2.12.0.dev with CUDA 12.8 on an RTX 5070 Ti (Blackwell).
+- `pip install mamba-ssm causal-conv1d` failed with
+  `NameError: name 'bare_metal_version' is not defined` (setup.py
+  probing for nvcc).
+- `torchcde` installed cleanly but Neural CDE's ODE solver overhead
+  would be 5-10× per batch on T=60.
+
+**Implementation.** Two pure-PyTorch alternatives added to
+`layer2_alpha.py` and dispatched via a new `--model {tcn,transformer,mamba}`
+flag in `train_stream.py`:
+
+1. **TransformerSpikePredictor** — causal Transformer encoder, sinusoidal
+   positional encoding, pre-norm, 3 layers, d_model=32, 4 heads,
+   dim_ff=128. Tests "attention vs convolution" without ODE/scan overhead.
+   ~38K trainable params.
+
+2. **MambaSpikePredictor** — hand-rolled minimal Mamba (Gu & Dao 2023)
+   in pure PyTorch. `MambaBlock` implements:
+   `Linear → split x,z → causal Conv1d(d_conv=4) → SiLU → SSM scan
+   → gate by SiLU(z) → Linear out → residual`. The SSM scan computes
+   input-dependent Δ via softplus(dt_proj(x_proj)), discretizes A and
+   B per-tick, and runs a sequential O(L) recurrence in fp32 (bf16
+   underflows on `exp(Δ·A)` for thin states). 3 blocks, d_state=16,
+   d_conv=4, expand=2. **30,241 trainable params** — matches TCN's
+   31,265 for clean architecture-only comparison.
+
+Refactored both TCN and the new models to expose a common
+`forward_logits()` method so the training loop is model-agnostic.
+Causality verified on Mamba: zeroing future tokens does not change
+past hidden states (max diff = 0.0).
+
+**Results — same protocol as Path D (7d × 3-coin, shock labels, AUCM,
+PESG lr=0.01):**
+
+| Architecture | Epochs | Params | F2 | Max prec | Max-prec ÷ base rate | Sweep shape |
+|---|---:|---:|---:|---:|---:|---|
+| **TCN (Path D)** | 1 | 31,265 | **0.121** | **0.050** | **1.81×** | smooth monotone climb |
+| Transformer | 1 | 38,337 | 0.126 | 0.034 | 1.22× | degenerate cliff |
+| Transformer | 3 | 38,337 | 0.126 | 0.052 | 1.88× | smoother climb, comparable to TCN |
+| **Mamba** | 1 | **30,241** | 0.126 | 0.032 | 1.15× | **degenerate cliff** |
+
+**What's confirmed:**
+
+- **H2 (architecture-cadence mismatch) is NOT the binding constraint.**
+  All three architectures converge to F2 ≈ 0.12. The Mamba selective
+  scan — the most theoretically-motivated fix for irregular cadence —
+  produced the *worst* discrimination (max prec 0.032 = 1.15× base
+  rate, vs TCN's 0.050 / 1.81×). Even with 3 epochs of Transformer
+  training, max precision (0.052) only barely exceeded TCN's 1-epoch
+  result.
+- Loss trajectories across all three architectures peak around
+  batch 1500 and plateau in [0.025, 0.030]. The architectures are
+  finding the same loss minimum given current data + AUCM. The
+  remaining gap is not in the model class.
+
+**Why Mamba didn't help (interpretation):**
+
+- The selective scan addresses irregular *sampling intervals*. HL data
+  is irregular but tick-indexed; once the harvest collapses bursty
+  arrivals into per-tick rows, the *index distance* between ticks no
+  longer carries the cadence information that the scan's Δ would
+  exploit. Adding explicit Δt as a 6th input channel might recover
+  this — deferred as a follow-up.
+- The pure-PyTorch scan ran ~25 min for 1 epoch vs TCN's 7 min (~3-4×
+  slower) due to sequential CUDA kernel launches without the fused
+  mamba-ssm kernel. Not a quality issue but limits iteration speed.
+- A 3-epoch Mamba run would cost ~75 min for marginal info given the
+  Transformer 3-ep result showed no F2 change with more training.
+
+**What's NOT yet addressed:**
+
+- **H5 — implicit label noise.** `identify_shock_events` uses
+  price-spike + VPIN criteria calibrated on equities. The shocks it
+  labels in HL data may not be the ones that have predictable
+  pre-shock microstructure signatures.
+- H1 (more data) — DR demoted; least likely.
+
+**Forward pointer.** P3.7 (Path E) — self-supervised pretext
+pretraining. Train the encoder on dense next-tick OBI/mid prediction
+(MSE, ~6.5M supervisory steps per epoch — orders of magnitude denser
+than the 180K shock labels), freeze, then fine-tune a fresh
+classification head on shock labels with AUCM. Insulates the encoder
+from heuristic-label noise by forcing it to learn the underlying
+microstructure manifold first.
+
+**Note on weight artifacts.** The single `tcn_weights_<SLUG>.pt` path
+in `config.py` was overwritten by each architecture's training run.
+Path D TCN weights are recoverable by re-running Path D's training
+command; the Path C model weights (Transformer 3-ep is the most
+recent) currently occupy that path. A future iteration should append
+the model name to the weights/threshold paths.
+
+**Artifacts (in `calibration/`):**
+`tcn_weights_BTC_USDC_USDC.pt` (currently: Transformer 3-ep, then
+overwritten by Mamba 1-ep — Path D recovery requires re-train).
+`tcn_threshold_BTC_USDC_USDC.json` (chosen: thr=0.05, F2=0.126,
+Mamba). `tcn_threshold_sweep_BTC_USDC_USDC.csv`.
+
+### 13.7 Run-to-run variance addendum (2026-05-11)
+
+After Path C concluded, a Path D recovery run (same code, same data,
+same args, no seed set) produced F2 = 0.104 vs the original Path D's
+F2 = 0.121. The recovery sweep curve shape is qualitatively the same
+(smooth monotone precision climb, no cliff) but the absolute numbers
+shifted by ~14%.
+
+This means **all single-run F2 comparisons in §13.4–§13.6 have noise
+of ~±0.02**. Specifically:
+
+- Path A vs Path D (0.102 → 0.121, +0.019) — within noise. Path D's
+  signal is the *recall lift* (0.377 → 0.723) which is robust to seed,
+  not the F2 lift.
+- Path D vs Path C (0.121 vs 0.126) — within noise. Path C's claim of
+  marginal improvement is not statistically supported by single runs.
+  The honest read is: TCN/Transformer/Mamba all sit in F2 ∈ [0.10,
+  0.13] under this protocol.
+
+**What survives.** The qualitative findings are robust:
+- AUCM removed the §13.3 trivial-collapse pathology (predict-all
+  /predict-nothing cliff). Sweep curves are now non-degenerate across
+  architectures.
+- Max precision is consistently ≤ 2× base rate regardless of
+  architecture or features-within-current-set.
+- Mamba's degenerate cliff at 1 epoch (max prec 0.032 = 1.15× base
+  rate) is materially worse than TCN/Transformer — that one *is*
+  outside noise.
+
+**Implications for future runs.**
+- Set a fixed seed in `train_stream.py` (currently absent). One-line
+  fix.
+- Report 3-seed mean ± std for any path comparison, not single runs.
+- Update Path E and any future paths' protocols to require ≥3 seeds.
+
+This doesn't change the path priorities (H5 is still the highest-
+leverage remaining hypothesis) but it does temper how much we trust
+the cross-path F2 numbers.
+
+### 13.8 Path E — SSL pretext pretraining (2026-05-11) — TESTED NEGATIVE
+
+H5 (implicit label noise) was the last unaddressed hypothesis from
+the §13.3 list. Path E tests it via self-supervised pretraining: train
+the encoder on a *dense* target (~6.5M next-tick log-returns), freeze
+it, then fine-tune a fresh classification head with AUCM on the
+sparse shock labels. The rationale: if heuristic shock labels are
+noisy, putting most of the model's capacity behind a frozen,
+labels-independent encoder protects it from learning the noise.
+
+**Implementation.** `train_stream.py` gained three flags:
+
+- `--pretext` — dataset emits next-tick log-return (in bps) as the
+  target; MSE loss; Adam at lr=1e-3; skips threshold sweep; saves to
+  `pretrain_weights_<SLUG>.pt`.
+- `--load-pretrained PATH` — `load_state_dict(strict=False)` at
+  startup so the head can be re-initialized for the new task.
+- `--freeze-encoder` — sets `requires_grad=False` on every parameter
+  except `head.*`. Only the head (Linear(32, 1) = 33 params) trains.
+
+Backward-compat preserved: the existing `aucm` / `focal` / `bce`
+paths are unchanged.
+
+**Phase 1 (pretrain) — 2 epochs on 7d × 3-coin:**
+
+- Loss curve: 19.6 → 0.35 (bps² MSE). The √loss ≈ 0.59 bps RMSE on
+  per-tick log-return prediction — reasonable for HL microstructure.
+- Encoder learned a non-trivial representation of next-tick price
+  dynamics (loss decreased monotonically, not stuck).
+
+**Phase 2 (fine-tune) — 1 epoch, frozen encoder, AUCM, PESG lr=0.01:**
+
+- `Encoder FROZEN. Trainable: 33 / 31,265 (0.11%)` — only the head's
+  Linear(32, 1) is updated.
+
+Threshold sweep — chosen `thr=0.050, prec=0.028, rec=0.992, F1=0.054,
+F2=0.126`. Selected rows:
+
+| Threshold | pred_pos | TP | FP | FN | prec | rec | F2 |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 0.05 | 3,209,551 | 89,861 | 3,119,690 | 766 | 0.028 | 0.992 | **0.126** ← chosen |
+| 0.10 | 636,387 | 20,125 | 616,262 | 70,502 | 0.032 | 0.222 | 0.099 |
+| 0.15 | 382,724 | 12,979 | 369,745 | 77,648 | 0.034 | 0.143 | 0.089 |
+| 0.20 | 213,473 | 7,911 | 205,562 | 82,716 | 0.037 | 0.087 | 0.071 |
+| 0.25 | 88,571 | 3,477 | 85,094 | 87,150 | 0.039 | 0.038 | 0.039 |
+| 0.30 | 18,151 | 853 | 17,298 | 89,774 | 0.047 | 0.009 | 0.018 |
+| 0.35 | 521 | 25 | 496 | 90,602 | 0.048 | 0.000 | 0.001 |
+
+**Verdict.** Indistinguishable from Path D / Path C results within
+the ±0.02 single-seed variance band (§13.7). H5-via-SSL did not
+break the F2 ≈ 0.12 / max-prec ≈ 1.7-1.8× base-rate ceiling.
+
+**What this tells us about the dataset.**
+
+Five interventions (loss, features, architecture × 2, SSL) all
+converge to the same F2 band:
+
+| Path | Hypothesis | F2 | Max prec | Max prec / base |
+|---|---|---:|---:|---:|
+| §13.3 | (baseline, BCE/Focal) | 0.046 | flat | 1.00× |
+| A | H4 — loss collapse | **0.102** | 0.040 | 1.70× |
+| D | H3 — feature inadequacy | 0.121 | 0.050 | 1.81× |
+| C (Transformer 3ep) | H2 — architecture | 0.126 | 0.052 | 1.88× |
+| C (Mamba 1ep) | H2 — architecture | 0.126 | 0.032 | 1.15× |
+| **E (SSL frozen)** | **H5 — label noise** | **0.126** | **0.048** | **1.73×** |
+
+**Path A was the only intervention that produced a replicable jump
+above the §13.3 noise floor.** Everything after operates in the same
+narrow band. This is the effective signal-extraction ceiling of the
+current data + labeling scheme.
+
+Plausible explanations for the ceiling:
+
+1. **The labels themselves cap the signal.** `identify_shock_events`
+   may flag mostly-unpredictable events on HL — heuristic-defined
+   shocks whose precursors aren't in OBI/MLOFI/VAMP/Kyle's λ at any
+   temporal scale, and aren't learnable from next-tick dynamics
+   either (since SSL didn't help). The "signal" KS test (D=0.13 on
+   OBI in last 10 ticks before shock) confirms *some* signal exists,
+   but it may be a weak statistical regularity in a small subset of
+   events, not a learnable invariant.
+2. **Data scale floor (H1, DR-demoted).** 181K positives across 3
+   coins × 7 days is below the threshold needed for *any* deep
+   learning model to extract this signal cleanly. Confirming this
+   would require harvesting 30+ coin-days and re-running Path A.
+3. **The feature space is missing something fundamental** that
+   neither the crypto-native features (Path D) nor SSL encoder
+   (Path E) can recover — e.g., truly dimensionless representations
+   (Path G), explicit Δt cadence, or order-level (not aggregated)
+   data.
+
+**What remains.** With H4 ✓, H3 ✓, H2 ✗, H5 ✗, the unaddressed
+hypotheses are:
+
+- **H1 — more data.** Now the highest-leverage remaining bet, though
+  expensive (re-harvest cost ~$1 + 3 hours per 7-day extension).
+  Would need 30+ coin-days to clearly test.
+- **Path G — dimensionless features.** Parked on branch
+  `research/path-g-dimensionless`. 4-day research project; would
+  test whether universal correlations exist in dimensionless space.
+- **Deeper label investigation.** Run P0.5 (diagnostic recipe) step
+  1 (logistic regression on un-windowed raw ticks) to check whether
+  the instant-level signal supports anything beyond what we've
+  achieved. If logistic AUROC is also ~0.55, we're at the data's
+  intrinsic ceiling regardless of model.
+
+**Recommendation.** Ship Path D's F2=0.121 as the current operating
+point. Pivot to live-deployment work (or P0.5 diagnostic + P3.6 Path
+G) rather than further hypothesis-test paths from this list. The
+hypothesis space defined in §13.3 has been substantially exhausted.
+
+**Artifacts (in `calibration/`):**
+`pretrain_weights_BTC_USDC_USDC.pt` (135 KB, SSL-trained TCN encoder).
+`tcn_weights_BTC_USDC_USDC.pt` (current: Path E fine-tuned head + 
+pretrained encoder). `tcn_threshold_BTC_USDC_USDC.json` (thr=0.05,
+F2=0.126).
+
+### 13.9 P0.5 + Path E diagnostics: data ceiling + label heterogeneity confirmed (2026-05-11)
+
+After Path E negative, ran two cheap diagnostics to characterize the
+F2 ≈ 0.12 ceiling:
+
+**C — P0.5 step 1: logistic regression on un-windowed raw ticks.**
+`tests/diagnose_tcn.py`. Multivariate logistic on the 5 Path D features
+(no windowing, no temporal aggregation) at the instant tick level,
+pooled across BTC + ETH + SOL (3.27M rows, 92,967 positives).
+
+| Metric | Value | Reference |
+|---|---:|---|
+| Multivariate AUROC | **0.5154** | Random = 0.500 |
+| AUPRC | 0.0302 | Base rate = 0.0284 |
+| AUPRC / base rate | **1.06×** | TSLA-equity at convergence: ~25× |
+| Per-feature `ce_ratio` AUROC | 0.5113 | Only feature above 0.501 |
+| `obi` univariate AUROC | 0.5010 | Random |
+| `mlofi`, `vamp`, `kyles_lambda` AUROC | 0.500–0.501 | Random |
+
+**Findings:**
+- The instant-level signal across all 5 features is at the noise
+  floor. `ce_ratio` is the only feature with any per-tick
+  predictive content, and even it's marginal (AUROC 0.5113).
+- **`obi` is at random at the instant level (AUROC 0.5010).**
+  The §13 KS-D=0.13 result on OBI must come purely from temporal
+  patterns in the trailing 10-tick window, not from any
+  individual tick's value. The TCN at F2 ≈ 0.12 is the model
+  successfully extracting some of that temporal pattern — but the
+  ceiling is set by how weakly even the windowed pattern
+  correlates with shock labels.
+- **TCN's F2=0.12 / max-prec=1.8× is therefore not "leaving signal
+  on the table"** — it's roughly extracting what the data offers.
+  The ceiling is intrinsic to the (features × labels) combination.
+
+**E — label inspection: `tests/inspect_shocks.py`.**
+`identify_shock_events` invoked per coin; event-level statistics and
+KS test of pre-shock OBI vs. random-window OBI.
+
+| Coin | Events | Event rate | \|Δp\|@±10 P95 | Buy:sell after event | KS D | KS p |
+|---|---:|---|---:|---:|---:|---:|
+| BTC | 365 | 1 / 2,988 ticks | 0.054% | 118 : 247 (32% : 68%) | **0.082** | 4.2e-11 |
+| ETH | 1,663 | 1 / 656 ticks | 0.058% | 589 : 1074 (35% : 65%) | **0.026** | 3.4e-05 |
+| SOL | 1,075 | 1 / 1,014 ticks | 0.080% | 411 : 663 (38% : 62%) | **0.023** | 5.7e-03 |
+
+§13 baseline (original pathA harvest, BTC): D=0.13, p~1e-28.
+
+**Findings — H5 (label noise) is empirically confirmed:**
+
+1. **Inter-event median is exactly 112 ticks across all three coins.**
+   That's the floor enforced by `MIN_SHOCK_SPACING_SECONDS = 60`
+   (~108 ticks at HL's ~1.8 ticks/s cadence). The heuristic is
+   firing as fast as the spacing constraint allows — events cluster
+   at the minimum. This means the heuristic is permissive: many
+   events are flagged, then deduplicated by the spacing rule.
+
+2. **Event magnitudes are far below the nominal 0.25% shock
+   threshold.** Mean |Δp/p| at ±10 ticks: 0.016–0.022%. P95:
+   0.054–0.080%. Max: 0.46–0.58%. `SHOCK_PRICE_MOVE_PCT = 0.0025`
+   (0.25%) is the configured threshold — but the heuristic must be
+   triggering on something *other* than that local price move
+   (likely VPIN spike + multi-tick price-move detector). The
+   "shock" label and "instantaneous large price move" are not the
+   same thing in this data.
+
+3. **Strong asymmetry — events overwhelmingly precede DOWN moves.**
+   Buy:sell after-event ratio ~32-38% : 62-68% across all coins.
+   Either the data window had a downtrend, or `identify_shock_events`
+   is more sensitive to sell-side imbalance. Either way: the
+   label distribution is asymmetric in a way the model may have
+   to learn around.
+
+4. **KS signal strength varies dramatically across coins**:
+   BTC retains D=0.082 (62% of §13's headline), but **ETH (D=0.026)
+   and SOL (D=0.023) are 5× weaker**. The OBI-pre-shock signal that
+   originally motivated this investigation is essentially a
+   BTC-specific phenomenon on the re-harvested data; on ETH and
+   SOL the labels are nearly indistinguishable from random windows.
+
+5. **Multi-coin pooling dilutes BTC's signal.** Training on
+   3-coin pool means BTC's D=0.082 signal is diluted by ETH+SOL's
+   D~0.025 near-noise. This explains why §13.3's multi-coin run
+   (F2=0.046) was only marginally better than single-coin BTC
+   (F2=0.027) — the additional coins added more *label noise*,
+   not more signal.
+
+6. **Visual inspection of the 16-event sample plots
+   (`calibration/inspection/shocks_*.png`) shows heterogeneous
+   event character.** Some events have clear vertical price jumps
+   at t=0 with coherent OBI patterns; others look like sub-noise
+   spikes. The heuristic is mixing real stress events with
+   transient triggers.
+
+**Synthesis — why the F2 ≈ 0.12 ceiling exists:**
+
+- The shock labels are noisy and coin-heterogeneous.
+- The instant-level signal on Path D features is at noise floor.
+- The windowed signal (TCN's 60-tick receptive field) extracts the
+  temporal pattern but it's a weak statistical regularity, not a
+  strong predictor.
+- Path A (loss) was the only intervention that helped because the
+  previous BCE/Focal pipeline was *worse than the data ceiling*
+  (collapsed to trivial). AUCM unlocked the data ceiling. Once
+  there, more features (D), better architecture (C), and SSL
+  pretraining (E) all hit the same wall because *the wall is
+  set by the labels, not the model*.
+
+**Forward.** Three plausible moves that aren't from the §13.3 list:
+
+1. **Per-coin training.** Drop multi-coin pooling. Train BTC-only
+   with AUCM + Path D features. BTC has the strongest signal
+   (D=0.082) and shouldn't be diluted. Estimate ~5 min train +
+   sweep; would test whether F2 lifts above 0.12 on BTC alone.
+
+2. **Refine `identify_shock_events`.** The current heuristic is
+   producing labels that don't admit signal extraction. Options:
+   tighten the price-spike threshold (filters down to true large
+   moves only); require both VPIN AND price-spike (not OR);
+   require ±N-tick post-event confirmation. This is a labeling
+   research project (~1 day) but probably the highest-leverage
+   move left.
+
+3. **Path G — dimensionless features** (branch
+   `research/path-g-dimensionless`). The cross-coin invariance test
+   in Path G's research plan is directly motivated by what we
+   found here: BTC's signal doesn't transfer to ETH/SOL under the
+   current feature set. Dimensionless features might restore
+   transferability. ~4 days. See also `BOUNDARY_CONDITIONS.md`
+   for the implementation traps to avoid.
+
+The investigation is effectively complete on the §13.3 hypothesis
+list. Further progress requires changing the labeling, the data
+scope, or the feature framework — not the model.
+
+**Artifacts (in `calibration/inspection/`):**
+`shocks_feature_history_<COIN>.png` — 16-event sample grids.
+`inspection_feature_history_<COIN>.txt` — per-coin numeric summaries.
+
+### 13.10 Option 1 reframe — pooling helps AUCM via volume, not signal homogeneity (2026-05-11)
+
+A follow-up experiment after §13.9 tested whether multi-coin pooling
+was diluting BTC's stronger per-coin signal (D=0.082 vs ETH 0.026 /
+SOL 0.023). **Result: pooling actually HELPS AUCM, contradicting §13.9's
+dilution framing.**
+
+**Setup.** BTC-only AUCM training, otherwise identical to Path D
+(7d BTC, shock labels, PESG lr=0.01, 1 epoch).
+
+**Result.**
+
+| Metric | BTC-only | Multi-coin (Path D) |
+|---|---:|---:|
+| Positives | 10,320 | 90,627 (9× more) |
+| Base rate | 0.95% | 2.77% |
+| Max precision | 0.010 | 0.050 |
+| Max-prec / base rate | 1.05× | 1.81× |
+| Chosen op point | thr=0.150, F2=0.046 | thr=0.050, F2=0.121 |
+
+**BTC-only F2 = 0.046 — collapsed to §13.3 noise floor.** Max precision
+only 1.05× base rate vs multi-coin's 1.81×.
+
+**Reframe.** AUCM's pairwise margin loss requires many positive×negative
+pairs per batch to compute a meaningful margin. With BTC's 10K positives
+in a 1M-tick stream + a 500K shuffle buffer, batch composition becomes
+pathological: ~10 positives per 2048-batch (~0.5%) instead of ~48
+(~2.3%) in the multi-coin pool. AUCM can't extract rank from contrast
+that thin.
+
+**§13.3 misread.** That section observed multi-coin (F2=0.046) was only
+marginally better than single-coin BTC (F2=0.027) under BCE/Focal —
+both were at the noise floor regardless of coin count. Under AUCM
+the picture inverts: multi-coin lifts to F2=0.121 *because* AUCM can
+use the volume; single-coin BTC stays at noise floor because it
+can't.
+
+**Implication for Option 2 (label refinement).** Refinements that
+shrink the event count (e.g., raising TURBULENCE_THRESHOLD 0.5 → 0.9
+to filter marginal VPIN spikes) risk dropping below AUCM's data-volume
+floor. The window-tightening route (Option 2a, `MAX_DIFFUSION_TICKS`
+6000 → 600) preserves event count better than threshold raising
+because it filters *which* VPIN spikes get tagged, not *whether* they
+get tagged. Recommended next experiment is 2a; see
+`~/.claude/plans/option-2-label-refinement.md` for the handoff.
+
+**What still survives §13.9's framing.** The labels ARE coin-heterogeneous
+(BTC has 4× stronger per-coin signal than ETH/SOL). But the right
+response is *better labels*, not *less data*. Multi-coin pooling stays
+correct for the current label scheme.
+
+### 13.11 Option 2a — window tightening collapsed event volume (2026-05-11) — TESTED NEGATIVE
+
+Executed the handoff plan in `~/.claude/plans/option-2-label-refinement.md`:
+`MAX_DIFFUSION_TICKS = 6000 → 600` (10× tighter VPIN-spike-to-price-move
+window). Goal: replace noisy "VPIN spike then any 0.25% move within 55 min"
+labels with tighter "VPIN spike then 0.25% move within 5 min" labels.
+
+**Inspection result (`tests/inspect_shocks.py`, BTC/ETH/SOL).**
+
+| Coin | Pre-2a events | Post-2a events | Reduction | Pre-2a KS D | Post-2a KS D |
+|---|---:|---:|---:|---:|---:|
+| BTC | 365 | 38 | 89.6% | 0.082 | 0.2434 (3.0×) |
+| ETH | 1663 | 341 | 79.5% | 0.026 | 0.0972 (3.7×) |
+| SOL | 1075 | 263 | 75.5% | 0.023 | 0.0886 (3.9×) |
+
+All three coins gained 3-4× pre-shock KS D — refined labels DO carry
+cleaner signal than the 6000-tick version. The label-quality direction
+is right.
+
+**Training result (multi-coin AUCM, same command as §13.4 / §13.10).**
+Positives 38,068 / 6,542,480 (density 0.582%, down from §13.10's 1.385%).
+**F2 = 0.043** at thr=0.250 (prec=0.012, rec=0.124). Below §13.10's
+BTC-only baseline (F2=0.046) and far below Path D's F2=0.121.
+
+**§13.10's volume caveat materialized.** Three concrete symptoms:
+
+1. `UserWarning: Input data has no positive sample!` from
+   `libauc.losses.auc:111` early in the run.
+2. Multiple `Current Loss: 0.0000` batches in the first ~500 batches —
+   same Path A imbalanced-collapse pathology recurring.
+3. At 0.582% positive density × 2048-batch ≈ 12 positives per batch.
+   §13.10's BTC-only run had ~10/batch and collapsed to F2=0.046.
+   Multi-coin pooling was preserved during 2a, but the volume drop
+   from window tightening pushed per-batch density into the same
+   starved regime.
+
+**§13.10's prediction was off.** §13.10 claimed window tightening
+"preserves event count better than threshold raising." In practice the
+10× window shrink cut events 75-90% — many VPIN spikes that qualified
+under "any 0.25% drift within 55 min" simply don't have a move within
+5 min. Tightening behaved more like a threshold raise than predicted.
+
+**Direction right, magnitude too aggressive.** Per option-2a's F2-bucket
+table for F2 < 0.10, next experiments:
+
+1. **2a-smaller — `MAX_DIFFUSION_TICKS = 2000`.** 3× tighter instead of
+   10×. Expected positive density ~1.0% (~20/batch — borderline for
+   AUCM but above the 12/batch breakdown point seen here).
+2. **2c — asymmetric labels (sell-side only).** Post-2a buy:sell ratios
+   were 15:23 (BTC), 136:205 (ETH), 114:149 (SOL); dropping ~40% of
+   buy-side could clean labels with less volume loss than tightening.
+3. **2d — coin-relative thresholds.** Long-term right answer per §13.10.
+
+**State left.** `config.py` `MAX_DIFFUSION_TICKS` stays at 600 for the
+next experimenter to inspect (Step 1's commit notes the change).
+Artifacts `calibration/tcn_weights_BTC_USDC_USDC.pt`,
+`calibration/tcn_threshold_BTC_USDC_USDC.json`,
+`calibration/tcn_threshold_sweep_BTC_USDC_USDC.csv`,
+`calibration/inspection_2a/*`, and `aucm_option2a.log` reflect the
+collapsed F2=0.043 run. Path D baseline (F2=0.121) requires reverting
+`MAX_DIFFUSION_TICKS` to 6000 and re-running, modulo the ±0.02
+single-seed variance noted in §13.7.
+
+### 13.12 Option 2a-smaller — volume preserved, F2 still collapsed (2026-05-11) — TESTED NEGATIVE
+
+Follow-up to §13.11 per the F2-bucket table's "use 2a with smaller change"
+guidance. `MAX_DIFFUSION_TICKS = 600 → 2000` (3× tighter than 6000 instead
+of 10×). Hypothesis: less aggressive window shrink preserves enough
+positives for AUCM while keeping label quality lift.
+
+**Inspection (`tests/inspect_shocks.py`, BTC/ETH/SOL, 2000-tick window).**
+
+| Coin | Events | Reduction vs 6000 | KS D | Δ vs 6000 |
+|---|---:|---:|---:|---:|
+| BTC | 147 | 59.7% ↓ | 0.0933 | +0.011 (1.14×) |
+| ETH | 912 | 45.2% ↓ | 0.0587 | +0.033 (2.26×) |
+| SOL | 688 | 36.0% ↓ | 0.0596 | +0.037 (2.59×) |
+
+Events sit between §13.10's 6000 (3103 total) and §13.11's 600 (642 total).
+KS D is modestly elevated vs Path D across all coins, less dramatically
+than the 600 case (BTC was 0.2434 there).
+
+**Training result (multi-coin AUCM, same command as §13.4 / §13.11).**
+Positives 103,030 / 6,542,480 (density **1.57%**, *above* §13.10's
+1.39% Path D baseline). Per-batch positives ~32 — far above the
+12/batch breakdown point seen in §13.11. **No `UserWarning`, no
+`Current Loss: 0.0000` batches.** AUCM volume floor is not the
+constraint here.
+
+**F2 = 0.079** at thr=0.100 (prec=0.019, rec=0.363). Falls in the
+"< 0.10" bucket of option-2a's interpretation table. Better than
+§13.11's F2=0.043 but still 35% below §13.10's Path D baseline of
+F2=0.121.
+
+**Diagnosis — volume preserved, signal still degraded.** Max precision
+~0.028 = 1.78× the 1.57% base rate. Path D had max prec ~0.050 = 3.6×
+its base rate. The model is finding *weaker* discrimination than the
+6000-tick baseline despite cleaner per-event KS D.
+
+**Working hypothesis (label-boundary noise).** Tightening the diffusion
+window introduces a new failure mode: VPIN spikes whose 0.25% price
+move happens *just after* 2000 ticks (~18 min) are labeled NEGATIVE,
+while topologically identical spikes with the same pre-shock signature
+but a move within 2000 ticks are labeled POSITIVE. The model sees
+similar OBI/MLOFI/VAMP patterns mapped to opposing labels — the
+information content of the labels drops even as the KS-D metric
+suggests they're cleaner. KS D measures distributional separation of
+pre-shock context vs random; it does not penalize the
+labeling-boundary contradiction.
+
+If correct, this means **diffusion-window-based label refinement is
+self-defeating beyond a point**: tighter windows trade volume noise
+(2a's failure mode) for boundary-classification noise (2a-smaller's
+failure mode). Neither dominates Path D's F2=0.121 with the
+6000-tick "permissive" definition.
+
+**Conclusion.** Label refinement via `MAX_DIFFUSION_TICKS` is
+exhausted as a single-knob strategy. Both candidate-2 alternatives
+worth trying (2c asymmetric labels, 2d coin-relative thresholds)
+are now lower-priority than addressing the *features* — Path G's
+dimensionless features test cross-coin invariance, which is the
+structural concern that survives §13.10's "labels are heterogeneous"
+finding regardless of how labels are tuned.
+
+**Action.** Pivoting to Path G implementation. See branch
+`research/path-g-dimensionless` for planning docs (README,
+RESEARCH_PLAN, THEORY, BOUNDARY_CONDITIONS). The active Path G
+implementation branch and progress will be tracked in §13.13.
+
+**State left.** `MAX_DIFFUSION_TICKS = 2000` in `config.py`. New
+artifacts: `calibration/inspection_2a_smaller/*`, `aucm_option2a_smaller.log`,
+and overwritten weights/thresholds in `calibration/tcn_*_BTC_USDC_USDC.{pt,json,csv}`
+reflect the F2=0.079 run.
+
+### 13.13 Path G — Phase 2+3 implemented; Phase 4 awaits re-harvest (2026-05-11)
+
+After §13.12's exhaustion of label-knob tuning, pivoted to Path G —
+the dimensionless-features research project that was parked in
+`mini_projects/path_G_dimensionless/` on branch
+`research/path-g-dimensionless`. Phases 1 (theory), 2 (online scale
+estimators), and 3 (π-group computation) per `RESEARCH_PLAN.md`.
+This session landed Phases 2+3 on master (working tree, not yet
+committed); Phase 4 is blocked on a re-harvest with the new column
+schema.
+
+**What landed in `layer1_sensors.py`.**
+
+1. **`CharacteristicScales`** — rolling online estimators for
+   `(τ_c, L_c, D_c, V_c, κ_c)`. All denominators floored to their
+   quantization unit per `BOUNDARY_CONDITIONS.md`:
+   - `L_c ≥ TICK_SIZE` (spread can't drop below 1 tick)
+   - `τ_c ≥ min_tau_ms / 1000` (inter-tick can't be zero)
+   - `V_c ≥ MIN_ORDER_SIZE / window_s` (volume rate floor)
+
+   Feeds: `on_trade(qty)` between book snapshots (sign-blind throughput
+   for V_c); `on_book(ts_ms, mid, spread, kyles_lambda)` on each
+   snapshot. Lookback default 200 ticks, matching
+   `KYLES_LAMBDA_LOOKBACK_TICKS`.
+
+2. **`compute_dimensionless_features(dt_ms, vamp_minus_mid_abs, scales)`**
+   — wraps each raw π in `tanh(raw / scale_factor)` for bounded,
+   differentiable saturation at quantization boundaries (per
+   `BOUNDARY_CONDITIONS.md` §"Mitigation 2"). Returns four groups:
+   - `fo_market = tanh(D·Δt / L_c²)` — diffusive timescale vs Δt
+   - `sr = tanh(Δt / τ_c)` — local vs recent cadence
+   - `pi_kappa = tanh(κ·V·τ / L)` — dimensionless price impact
+   - `pi_vamp_dim = tanh((VAMP−mid) / L)` — queue deviation in spread units
+
+   `π_obi` and `π_mlofi` are already dimensionless in the existing
+   pipeline — kept as-is, no recomputation needed (THEORY.md §π₄, §π₅).
+
+3. **`PATH_G_TANH_SCALES`** module-level dict with best-effort
+   initial scale factors `{fo_market: 1e-2, sr: 5.0, pi_kappa: 1.0,
+   pi_vamp_dim: 1.0}`. Smoke test confirmed `fo_market` saturates
+   at 1.0 with these values on synthetic input — these need
+   empirical recalibration from the first harvest's 95th-percentile
+   per `BOUNDARY_CONDITIONS.md` before Phase 4 training.
+
+4. **`PhysicsState`** extended with 9 new fields: 4 tanh-bounded
+   π-groups (`fo_market`, `sr`, `pi_kappa`, `pi_vamp_dim`) and 5 raw
+   scales (`tau_c_s`, `L_c`, `D_c`, `V_c`, `kappa_c`). All default to
+   `0.0` so the equity path (no L2 depth, no trades) emits zeros
+   without changes elsewhere.
+
+5. **`FeatureDumper.HEADER`** extended from 12 to 23 columns: adds
+   the 4 π-groups, 5 raw scales, and 2 top-of-book sizes
+   (`bid_sz_top`, `ask_sz_top`). Top-of-book sizes were missing from
+   the prior schema and are needed to re-derive π-groups under
+   different tanh-scale calibrations without re-running the engine.
+   Column-name lookup in `train_stream.py` keeps old CSVs readable.
+
+6. **`SensorArray`** wired up: `CharacteristicScales` instantiated
+   for HL crypto only (same gating as MLOFI / Kyle's λ), fed via
+   `on_trade` in `_process_trade`, `on_book` + π-group computation
+   in `_process_order_book` (after Path D features so it can reuse
+   `kyles_lambda` for κ_c), reset in `reset_session`.
+
+**Smoke test.** A synthetic two-snapshot trace produced expected
+scale values (`τ_c=0.5s, L_c=0.55, D_c=2.0 P²/s, V_c=1.0 Q/s`) and
+tanh-bounded π-groups. `PhysicsState` accepted all new fields at
+construction. `layer1_sensors.py` parses cleanly. No live data
+exercised yet.
+
+**What did NOT land — Phase 4 (training) blocker.**
+
+The existing `calibration/feature_history_*.csv` files (12 columns)
+do not contain the Path G outputs. `train_stream.py` reads columns
+by name, so old CSVs are still loadable, but a Path G training run
+needs the new columns — which means a re-harvest. Two paths:
+
+1. **Live harvest with extended schema.** Run
+   `fetch_history_hyperliquid.py` (or equivalent) to capture fresh
+   data using the now-extended `FeatureDumper`. Needs the user's
+   AWS creds; not available in this shell.
+2. **Replay-mode harvest.** If the existing CSV's `best_bid` /
+   `best_ask` series can be re-played through a fresh SensorArray,
+   `CharacteristicScales` and the π-groups can be recomputed
+   offline. But `V_c` needs raw trade volumes — which the CSV
+   doesn't preserve — so the dimensionless features `pi_kappa`,
+   `pi_vamp_dim`, and `fo_market` would all be partial. `sr` alone
+   is recoverable from `timestamp_ms` deltas.
+
+**What ALSO did NOT land — TCN consumption.** `TCN_INPUT_CHANNELS`
+in `config.py` stays at 5 (Path D). `train_stream.py`'s feature
+stack still references only Path D columns. Adding Path G channels
+is a Phase 4 task: needs new harvest, then a config switch + a
+feature-stack branch in `train_stream.py`.
+
+**What ALSO did NOT land — stress-slice validation.** The five
+boundary scenarios in `BOUNDARY_CONDITIONS.md` (low-vol lull,
+first-tick-of-session, sub-second burst, 1-tick-spread under high
+volume, stale book) need a real data slice to histogram each π
+against. Initial tanh saturation already triggered on synthetic
+input — the empirical 95th-percentile calibration is mandatory
+before Phase 4 training.
+
+**Next session's path.**
+
+1. Re-harvest with the extended `FeatureDumper` schema (live or
+   replay-with-trades). Save as
+   `calibration/feature_history_<COIN>.pathG.csv` to preserve the
+   Path D baselines.
+2. Run stress-slice validation per `BOUNDARY_CONDITIONS.md`
+   checklist. Re-calibrate `PATH_G_TANH_SCALES` from the 95th-
+   percentile of each raw ratio on a baseline regime.
+3. Phase 4 training: extend `TCN_INPUT_CHANNELS` to 9 (5 Path D +
+   4 Path G), branch `train_stream.py`'s feature stack, run AUCM
+   on the new schema. Target: F2 ≥ 0.18 OR cross-coin retention
+   ≥ 70% (RESEARCH_PLAN.md success criteria).
+4. Phase 5 writeup in `mini_projects/path_G_dimensionless/RESULTS.md`
+   on `research/path-g-dimensionless` branch.
+
+**Branch hygiene note.** Path G's README recommended branching from
+`research/path-g-dimensionless`; this session implemented on `master`
+instead to keep the §13 investigation log linear. The
+implementation can be cherry-picked or rebased onto
+`feature/path-g-impl` cleanly if/when the planning-branch hygiene
+is desired.
+
+**State left.** `layer1_sensors.py` modified (uncommitted).
+`config.py` `MAX_DIFFUSION_TICKS` still at 2000 from §13.12 — has
+no effect on Path G since Path G's feature columns aren't yet
+consumed by the TCN. No new artifacts (no training run, no
+inspect).
+
+**Addendum — tanh-scale calibration (2026-05-11, evening).** A 56,734-row
+BTC smoke harvest (HL `node_fills_by_block/hourly/20260406/*.lz4`) ran
+the extended `FeatureDumper` end-to-end and exposed two of four π-groups
+as miscalibrated under the hand-picked defaults:
+
+| π | default scale | empirical p95(\|raw\|)/2 | issue |
+|---|---:|---:|---|
+| `fo_market` | 1e-2 | 7.932 | saturated at 1.0 |
+| `sr` | 5.0 | 0.5442 | mildly under-saturated |
+| `pi_kappa` | 1.0 | 1.38e-06 | dead at machine precision |
+| `pi_vamp_dim` | 1.0 | 0.248 | mildly under-saturated |
+
+`PATH_G_TANH_SCALES` in `layer1_sensors.py` updated to the empirical
+values above. The overnight 4-coin × 14-day harvest used these scales.
+
+**Addendum — multi-coin recalibration (2026-05-11 → 2026-05-12, post-harvest).**
+Overnight harvest produced ~2.17M rows per coin × 4 coins. Morning
+sanity-check confirmed the BTC-only scales DID generalize poorly:
+
+| coin | last-row `fo` | last-row `pk` | issue |
+|---|---:|---:|---|
+| BTC | 0.026 | 0.0086 | fine |
+| ETH | 0.0044 | **+1.000** | pk saturated |
+| SOL | 0.000 | **−1.000** | pk saturated |
+| HYPE | 3e-6 | **+1.000** | pk saturated |
+
+`calibrate_path_g_scales.py` was added and run over the pooled 8.67M-row
+distribution. Resulting pooled scales:
+
+| π | BTC-only smoke | pooled multi-coin | shift |
+|---|---:|---:|---:|
+| `fo_market` | 7.932 | 3.448 | 0.43× |
+| `sr` | 0.5442 | 0.5566 | 1.02× |
+| `pi_kappa` | 1.38e-06 | 2.875e-04 | **208×** |
+| `pi_vamp_dim` | 0.248 | 0.2315 | 0.93× |
+
+The `pi_kappa` shift confirms `BOUNDARY_CONDITIONS.md`'s warning about
+depth heterogeneity — ETH/SOL/HYPE have thinner books than BTC, which
+makes Kyle's λ (κ_c) 100-300× larger and would have left
+`pi_kappa` constant-saturated on every non-BTC coin during training.
+
+`PATH_G_TANH_SCALES` in `layer1_sensors.py` updated to the pooled
+values. `recompute_path_g_pi_groups.py` was added to recompute the
+four tanh-bounded columns in each CSV from the raw scale columns —
+crash-safe atomic rewrite, single source of truth for tanh scales
+imported from `layer1_sensors.py`. The raw scales (`tau_c_s`, `L_c`,
+`D_c`, `V_c`, `kappa_c`) in CSV are ground truth from the harvest and
+remain untouched, so further calibration changes are always
+recoverable via the recompute script.
+
+### 13.14 Path G — Phase 4 cross-coin invariance test (2026-05-12) — TESTED NEGATIVE
+
+Phase 4 of `RESEARCH_PLAN.md` ran four experiments to answer the
+headline Path G question: does adding the four dimensionless π-groups
+to the TCN input stack improve cross-coin transfer?
+
+**Setup.** `TCN_INPUT_CHANNELS` extended from 5 → 9 (Path D channels
++ `[fo_market, sr, pi_kappa, pi_vamp_dim]`) behind a new
+`USE_PATH_G_FEATURES` env var (config.py + train_stream.py edits;
+AlphaEngine inference parity intentionally NOT updated — research
+branch, not deployable). AUCM/PESG protocol matched §13.4 exactly.
+
+**Experiments and results.**
+
+| run | features | train coins | val coin | F2_val | retention vs 0.121 |
+|---|---|---|---|---:|---:|
+| §13.4 baseline | Path D (5) | BTC/ETH/SOL | — (in-domain) | **0.121** | 100% |
+| 4-coin Path G | Path D+G (9) | BTC/ETH/SOL/HYPE | (in-domain) | 0.066 | 55% |
+| 4-coin Path D (control) | Path D (5) | BTC/ETH/SOL/HYPE | (in-domain) | 0.066 | 55% |
+| 3-coin Path D + HYPE val | Path D (5) | BTC/ETH/SOL | HYPE | **0.0545** | 45% |
+| 3-coin Path G + HYPE val | Path D+G (9) | BTC/ETH/SOL | HYPE | **0.0534** | 44% |
+
+**Two conclusions.**
+
+1. **HYPE poisoned the 4-coin pool.** The control with Path D-only
+   features (USE_PATH_G_FEATURES=0) on the same 4-coin pool got
+   F2=0.066 — identical to the Path G run. Path G features were
+   innocent; the F2 drop from 0.121 to 0.066 came entirely from
+   adding HYPE to the training set.
+2. **Path G's dimensionless framework delivered zero invariance
+   lift.** With the cleanest test design (3-coin train, HYPE
+   held-out as val), Path G's F2=0.0534 vs Path D's F2=0.0545 differ
+   by 0.0011 — well inside the ±0.02 single-seed variance band
+   (§13.7). The 7 candidate π-groups in `THEORY.md` (4 implemented)
+   did not produce the universal-correlation behavior that
+   Buckingham-π predicted for these markets.
+
+`RESEARCH_PLAN.md` success criteria — all three failed:
+- F2 (in-domain) ≥ 0.20 — no
+- Cross-coin F2 retention ≥ 70% — no (44%)
+- Any π-group improves AUC by 0.02 — no
+
+This is `RESEARCH_PLAN.md`'s "clean negative" outcome.
+
+**Why label-side, not feature-side.** Three signals converge on
+labels being the bottleneck, not features or architecture:
+
+1. **Same val F2 regardless of feature set.** Both 3-coin runs hit
+   F2≈0.054 on HYPE. If the issue were Path D's feature
+   non-transferability, Path G should have lifted retention.
+2. **Same val F2 regardless of pool composition.** 4-coin
+   in-domain F2 = 3-coin HYPE-val F2 ≈ 0.054. HYPE behaves the same
+   way whether trained on or held out — its labels don't carry
+   ranking signal under the current trigger.
+3. **HYPE's val_loss (0.0092) is LOWER than train_loss (0.0148).**
+   The model fits HYPE's marginal distribution fine. It can't
+   *rank* shocks from non-shocks because the labels are noisy.
+
+**Mechanism.** `identify_shock_events` triggers a shock when
+`|price_move| / price > SHOCK_PRICE_MOVE_PCT = 0.0025` (25 bps)
+within `MAX_DIFFUSION_TICKS` (2000 ticks ≈ 18 min). On BTC at
+σ ≈ 3.4 bps/√s, a 25 bps move over 18 min is a 0.22σ event —
+already inside the random-walk envelope. On HYPE with σ several
+times larger, a 25 bps move is well under 0.1σ — pure Brownian
+noise. So `identify_shock_events` over-fires on HYPE,
+generating ~22K "shocks" per coin that are actually random walks,
+not real microstructure events. The AUCM optimizer can't learn to
+rank random walks against actual liquidations.
+
+**Decision — pivot to per-symbol vol-scaled labels (option 2d from
+`option-2-label-refinement.md`).** Replace the fixed-percentage
+trigger with `|Δp| > k × √(D_c · Δt)` — a k-sigma event in
+absolute price units, using the rolling realized variance D_c that
+Path G already estimates and that the CSV already contains. This is
+the same trigger statistic across coins regardless of volatility
+regime. No re-harvest needed; labels are computed at training time
+from existing CSV columns.
+
+**State left.** `layer1_sensors.py`, `config.py`, `train_stream.py`
+all modified for Path G. Training logs `aucm_pathG.log`,
+`aucm_control_pathD_4coin.log`, `aucm_pathD_3coin_HYPEval.log`,
+`aucm_pathG_3coin_HYPEval.log` preserved. `tcn_weights_*.pt` reflects
+last run (Path G 3-coin + HYPE val, 9-channel). The `USE_PATH_G_FEATURES`
+env var stays in place so re-enabling Path G for future composition
+experiments is a one-flag change.
+
+### 13.15 Per-symbol vol-scaled labels — TESTED NEGATIVE; data ceiling verified (2026-05-12)
+
+§13.14 diagnosed labels as the bottleneck and recommended per-symbol
+vol-scaled triggers. Implemented and tested three configurations.
+
+**Implementation.** `identify_shock_events` extended with optional
+`D_c_series` (Path G's rolling realized variance, P²/s) and `k_sigma`
+parameters. New trigger: `|Δp| > k · √(D_c[t] · Δt_s)` — a k-sigma
+event in absolute price units, uniformized across symbols regardless
+of vol regime. `build_labels` wires `data["D_c"]` through to the
+trigger when `USE_VOL_SCALED_LABELS=1`. Subsequently extended with a
+`min_pct_floor` parameter to gate the trigger on BOTH statistical
+rarity AND structural significance: `threshold = max(k·σ·√Δt, floor·p)`.
+
+**Three trials, three negatives.**
+
+| run | density | F2 | max prec | max prec / base | verdict |
+|---|---:|---:|---:|---:|---|
+| §13.4 baseline (3-coin, old labels) | 1.39% | **0.121** | 0.050 | **3.6×** | real ranking |
+| §13.14 4-coin old labels (HYPE poison) | 1.37% | 0.066 | 0.023 | 1.7× | degraded |
+| vol-scaled k=3 (4-coin) | 2.56% | 0.118 | 0.026 | 1.02× | predict-all |
+| vol-scaled k=5 (4-coin) | 2.05% | 0.097 | 0.021 | 1.02× | predict-all |
+| hybrid k=3 + 15bps floor (4-coin) | 1.40% | 0.066 | 0.014 | 1.0× | predict-all |
+
+All three vol-scaled variants produce predict-all models — max precision
+collapses to base rate (1.0-1.02× lift) and F2 is driven entirely by
+recall=1.0 at the lowest threshold. The hybrid trigger's structural
+floor delivered the cleanest event distributions (BTC KS D=0.058,
+ETH=0.037, comparable to §13.4 baseline) but the rank signal still
+didn't materialize at training time.
+
+**What this proves.** The label-trigger refinement direction is
+exhausted. Three independent attacks — pure k-σ, more-selective k-σ,
+hybrid — all hit the same predict-all ceiling. The §13.14 diagnosis
+("labels are the bottleneck") was half right: HYPE labels under the
+old fixed-percentage trigger ARE worse than BTC's, but fixing the
+labels statistically did not unlock predictive signal in the leading
+features.
+
+**Connecting to the full §13 investigation.** Eight distinct attacks
+on the F2 ≈ 0.12 plateau:
+
+| § | approach | F2 | rank vs §13.4 |
+|---|---|---:|---|
+| §13.3 | Multi-coin, BCE/Focal (pre-AUCM) | 0.046 | well below |
+| §13.4 | AUCM loss (Path A) | 0.121 | baseline |
+| §13.5 | Crypto-native features (Path D) | 0.121 | held |
+| §13.6 | Architecture swap (Path C) | ≤ 0.121 | held/below |
+| §13.7 | Run-to-run variance | ±0.02 | (noise floor) |
+| §13.8 | SSL pretraining (Path E) | ≤ 0.121 | held/below |
+| §13.10 | Option 1 reframe (BTC-only AUCM) | 0.046 | below (volume) |
+| §13.11 | Label window 6000→600 | 0.043 | volume collapse |
+| §13.12 | Label window 6000→2000 | 0.079 | predict-all |
+| §13.14 | Dimensionless features (Path G) | 0.066–0.053 | below (HYPE poison) |
+| §13.15 | Vol-scaled labels (this) | 0.066–0.118 | predict-all |
+
+**Six independent strategies failed to lift F2 meaningfully above the
+0.121 baseline.** The signal in leading microstructure features
+(`ce_ratio`, `obi`, `mlofi`, `vamp`, `kyles_lambda`) appears to be
+inherently capped at ~1.8× base-rate precision on this dataset. This
+matches §13.9's diagnostic (univariate AUROC ≈ 0.5 on raw features,
+multivariate logistic AUROC 0.515 on un-windowed ticks) — there isn't
+enough mutual information between features and shocks for a TCN to
+extract more than the current edge.
+
+**Data ceiling verified.** F2 = 0.121 with max-precision ≈ 1.8× base
+rate is the current upper bound for cross-coin shock prediction on
+HL with the Path D feature set. Further label or feature engineering
+within this framing will yield diminishing returns.
+
+**Strategic pivot.** Path forward isn't more knob-tuning; it's a
+reframe. Three candidate next directions, in roughly increasing scope:
+
+1. **Per-symbol models** (abandon cross-coin pooling). Train separate
+   weights per coin. Loses transferability but each model is tuned to
+   its symbol's microstructure. The "data ceiling" might be a
+   pooling-distortion artifact — single-coin F2 could be higher if
+   the model isn't forced to fit a compromise distribution.
+2. **Different prediction target.** Drop "binary shock classification"
+   in favor of directional bias (which way will price move?),
+   regime/volatility classification (will the next minute be turbulent?),
+   or magnitude regression (how far?). These are easier statistical
+   targets that may carry stronger leading-feature signal.
+3. **More data + richer features.** Re-harvest with the extended
+   FeatureDumper schema for longer periods (1+ months per coin), add
+   missing microstructure channels (queue position, order-flow burst
+   statistics, cross-asset cointegration), and accept the cost. Only
+   pays off if (1) and (2) also fail.
+
+§13 investigation is effectively complete. Subsequent work belongs in
+a new §14.
+
+**State left.** `config.py` `USE_VOL_SCALED_LABELS` flag and
+`SHOCK_K_SIGMA` / `SHOCK_MIN_PCT_FLOOR` constants remain in place;
+all default OFF so legacy training behavior is the default.
+`calibration.py` `identify_shock_events` extended signature is
+backward-compatible (D_c_series=None preserves legacy trigger).
+`train_tcn.py` `build_labels` reads config flags. Logs:
+`aucm_volscaled_4coin.log` (k=3), `aucm_volscaled_k5_4coin.log` (k=5),
+`aucm_hybrid_k3_15bps_4coin.log` (hybrid). Inspection plots in
+`calibration/inspection_volscaled_k3/`, `calibration/inspection_hybrid_k3_15bps/`.
+`tcn_weights_*.pt` reflects last run (hybrid k=3 + 15bps). The Path D
+baseline weights (F2=0.121) can be regenerated with
+`USE_VOL_SCALED_LABELS=0` on the 3-coin pool.
