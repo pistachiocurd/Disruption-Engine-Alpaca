@@ -16,6 +16,8 @@
 
 ![Engine running in shadow mode against TSLA replay](docs/screenshots/dashboard_running.png)
 
+(NONE OF THIS IS TRUE ANYMORE UPDATE - READ OTHER DOCS FOR MORE UP TO DATE INFORMATION REGARDING MAJOR ARCHITECTURAL CHANGES)
+
 Physics-informed market microstructure research engine. Originally built
 as a shock-arbitrage system: detect pre-shock signatures via L2-aggregate
 features (a 5-channel TCN over a 60-tick rolling window), compute a
