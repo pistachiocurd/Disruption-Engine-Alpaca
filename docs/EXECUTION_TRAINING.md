@@ -6,29 +6,30 @@
 > mandates, baseline comparisons, and Layer 4 (shadow trainer) end-to-end
 > validation.
 
-## Why this document
+## Background
 
 L2 alpha is validated but unprofitable as a standalone signal (F2 = 0.106 /
 0.06 bps gross edge vs 5.5 bps round-trip cost — see
-[LAYER2_TRAINING.md §14.7-§14.8](LAYER2_TRAINING.md)). While the L3 (order-
-by-order) data harvest runs in the background on `research/path-h-l3`, the
-existing L2 alpha was used to drive forward progress on **Layer 3 (PPO
-execution)** and **Layer 4 (shadow trainer)** — both of which were
-structurally complete but never trained or validated end-to-end. The
-infrastructure built here transfers when L3 alpha arrives (only the PPO
-weights need retraining; eval harness, data providers, and Layer 4 pipeline
-carry over unchanged).
+[LAYER2_TRAINING.md §14.7-§14.8](LAYER2_TRAINING.md)). The L3 (order-by-
+order) capture lives in [../research/path_h_l3/](../research/path_h_l3/)
+and is independent of the execution layer. The existing L2 alpha is used
+here to exercise **Layer 3 (PPO execution)** and **Layer 4 (shadow
+trainer)** end-to-end — both layers were structurally complete prior to
+this work but never trained or validated against real mandate streams.
+The infrastructure built here transfers when an L3-derived alpha arrives:
+only the PPO weights need retraining; eval harness, data providers, and
+Layer 4 pipeline carry over unchanged.
 
-## Infrastructure shipped
+## Infrastructure
 
 | File | What it does |
 |---|---|
-| [train_ppo.py](train_ppo.py) | Offline PPO trainer. Streams `feature_history_<SYM>.csv` → AlphaEngine → ExecutionEnv → RolloutBuffer → PPOTrainer. Outputs `calibration/ppo_weights_<SYM>.pt` + per-update metrics CSV. |
-| [eval_ppo.py](eval_ppo.py) | Held-out comparison vs `always_taker`, `always_maker`, `naive_random`, and `random_init` baselines. Writes `calibration/eval_ppo_results.json`. |
-| [validate_layer4.py](validate_layer4.py) | End-to-end Layer 4 pipeline validation. Boots a slim L1→L4 stack, asserts five conditions (KL drift, regime non-degenerate, step gate, ≥1 promotion, Polyak math). |
-| [hpo.py](hpo.py) (modified) | `make_csv_data_provider` factory replaces the stub data providers; `evaluate_objective` now drives env state via an advancer callback so trials work end-to-end. |
-| [engine.py](engine.py) (modified) | Boots with `PPO_LIVE_CHECKPOINT` env-var override; shadow agent mirrored from live so initial KL ≈ 0. |
-| [config.py](config.py) (modified) | `PPO_LIVE_CHECKPOINT`, `MIN_SHADOW_STEPS`, `KL_THRESHOLD`, `REPLAY_BUFFER_HOURS` env-overridable. `SHADOW_TRAIN_INTERVAL_SEC` plumbed through `Engine.__init__`. |
+| [../training/train_ppo.py](../training/train_ppo.py) | Offline PPO trainer. Streams `feature_history_<SYM>.csv` → AlphaEngine → ExecutionEnv → RolloutBuffer → PPOTrainer. Outputs `calibration/ppo_weights_<SYM>.pt` + per-update metrics CSV. |
+| [../training/eval_ppo.py](../training/eval_ppo.py) | Held-out comparison vs `always_taker`, `always_maker`, `naive_random`, and `random_init` baselines. Writes `calibration/eval_ppo_results.json`. |
+| [../training/validate_layer4.py](../training/validate_layer4.py) | End-to-end Layer 4 pipeline validation. Boots a slim L1→L4 stack, asserts five conditions (KL drift, regime non-degenerate, step gate, ≥1 promotion, Polyak math). |
+| [../training/hpo.py](../training/hpo.py) | `make_csv_data_provider` factory replaces the prior stub data providers; `evaluate_objective` drives env state via an advancer callback so trials work end-to-end. |
+| [../engine.py](../engine.py) | Boots with `PPO_LIVE_CHECKPOINT` env-var override; shadow agent mirrored from live so initial KL ≈ 0. |
+| [../config.py](../config.py) | `PPO_LIVE_CHECKPOINT`, `MIN_SHADOW_STEPS`, `KL_THRESHOLD`, `REPLAY_BUFFER_HOURS` env-overridable. `SHADOW_TRAIN_INTERVAL_SEC` plumbed through `Engine.__init__`. |
 
 ## Environment-control mechanics
 

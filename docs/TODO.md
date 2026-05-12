@@ -6,15 +6,15 @@ condition for picking it back up, and rough effort estimate.
 
 For higher-level open frontiers (PPO checkpoint persistence, eval harness
 data providers, replay session-boundary detection) see [README.md "Open
-work / collaboration"](../README.md). For research-grade findings to
-implement (BC warm-start, SAC migration, RevIN, etc.) see §A/§B/§C of the
-deep-research review (synthesized in this session, in the plan file at
-`~/.claude/plans/fresh-session-i-want-deep-lake.md`).
+work / collaboration"](../README.md). Research-grade findings to
+implement (BC warm-start, SAC migration, RevIN, etc.) are referenced
+inline below as §A / §B / §C of the deep-research synthesis that
+drives the P0–P3.7 prioritization.
 
-For the dedicated TCN failure investigation (P0/P0.5 below), see
-`~/.claude/plans/tcn-failure-investigation.md` which includes the Gemini
-Deep Research synthesis (2026-05-10) that drives the prioritization of
-P0–P3.7.
+The dedicated TCN failure investigation that drives the prioritization
+of P0–P3.7 incorporated the Gemini Deep Research synthesis (2026-05-10)
+covering loss-geometry (H4 → AUCM), cadence (H2 → architecture swap),
+feature inadequacy (H3 → Path D), and label noise (H5 → SSL pretrain).
 
 ## Mini-projects (parked research, separate branches)
 
@@ -177,9 +177,9 @@ LAYER2_TRAINING.md. Five training configurations all produced F2 in
 [0.01, 0.05] regardless of single-coin vs multi-coin, regime vs shock
 labels, BCE vs focal, H=30 vs H=10, ep=1 vs ep=10.
 
-**Trigger to revisit.** Only if the dedicated TCN research session
-(see `~/.claude/plans/tcn-failure-investigation.md`) identifies an
-architecture/loss change that breaks through to F2 ≥ 0.30 on single-coin.
+**Trigger to revisit.** Only if the dedicated TCN failure investigation
+identifies an architecture/loss change that breaks through to F2 ≥ 0.30
+on single-coin.
 At that point retest multi-coin generalization with the working
 architecture.
 

@@ -422,8 +422,7 @@ percentage threshold including 1.0. The 2 % production gate would
 trip after a handful of episodes any time the engine started cold —
 which is exactly what we observed during the smoke test.
 
-Fix: hybrid gate (added in this session, see `engine.py` and
-`test_engine.py`):
+Fix: hybrid gate (see `engine.py` and `test_engine.py`):
 
 1. **Absolute USD cap** — `MAX_SESSION_DRAWDOWN_USD` (default
    $1000), always active. Trips when `peak - current > USD_cap`
@@ -747,7 +746,7 @@ about price direction over a tradeable horizon?**
 
 ### 14.3 Implementation
 
-Added in this session:
+Changes:
 
 1. `config.py`: `TCN_DIRECTIONAL_HORIZON_TICKS = 100` (~55s on HL's
    ~1.8 ticks/s — well past the spread-roundtrip timescale).
@@ -1106,9 +1105,8 @@ Full experiment progression on HL perps, in order:
    semantics; shocks we're labeling may not be the shocks the engineered
    features predict.
 
-Dedicated research session planned (see plan file
-`~/.claude/plans/tcn-failure-investigation.md`) to characterize the
-root cause more rigorously than this progression of ad-hoc experiments.
+Dedicated investigation planned to characterize the root cause more
+rigorously than this progression of ad-hoc experiments.
 
 ### 13.4 AUCM loss breakthrough (2026-05-10)
 
@@ -1742,8 +1740,8 @@ to filter marginal VPIN spikes) risk dropping below AUCM's data-volume
 floor. The window-tightening route (Option 2a, `MAX_DIFFUSION_TICKS`
 6000 → 600) preserves event count better than threshold raising
 because it filters *which* VPIN spikes get tagged, not *whether* they
-get tagged. Recommended next experiment is 2a; see
-`~/.claude/plans/option-2-label-refinement.md` for the handoff.
+get tagged. Recommended next experiment is 2a (window tightening; see
+§13.11 below for the executed run).
 
 **What still survives §13.9's framing.** The labels ARE coin-heterogeneous
 (BTC has 4× stronger per-coin signal than ETH/SOL). But the right
@@ -1752,7 +1750,7 @@ correct for the current label scheme.
 
 ### 13.11 Option 2a — window tightening collapsed event volume (2026-05-11) — TESTED NEGATIVE
 
-Executed the handoff plan in `~/.claude/plans/option-2-label-refinement.md`:
+Executed the §13.10 follow-up plan:
 `MAX_DIFFUSION_TICKS = 6000 → 600` (10× tighter VPIN-spike-to-price-move
 window). Goal: replace noisy "VPIN spike then any 0.25% move within 55 min"
 labels with tighter "VPIN spike then 0.25% move within 5 min" labels.
@@ -1986,7 +1984,7 @@ against. Initial tanh saturation already triggered on synthetic
 input — the empirical 95th-percentile calibration is mandatory
 before Phase 4 training.
 
-**Next session's path.**
+**Forward path.**
 
 1. Re-harvest with the extended `FeatureDumper` schema (live or
    replay-with-trades). Save as

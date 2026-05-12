@@ -358,15 +358,22 @@ disruption_arbitrage_engine/
 │   └── synthetic_data.py             # synthetic feature_history generator
 │
 ├── research/                 # parked / experimental work
-│   └── path_g/                   # dimensionless features (Buckingham-π)
-│       ├── recompute_path_g_pi_groups.py
-│       ├── calibrate_path_g_scales.py
-│       └── check_path_g_distributions.py
+│   ├── path_g/                   # dimensionless features (Buckingham-π)
+│   │   ├── recompute_path_g_pi_groups.py
+│   │   ├── calibrate_path_g_scales.py
+│   │   └── check_path_g_distributions.py
+│   └── path_h_l3/                # order-by-order L3 microstructure
+│       ├── README.md                 # path-H research overview + outstanding work
+│       ├── L3_RESEARCH_PLAN.md       # strategic plan + phased breakdown
+│       ├── DEPLOY_HARVESTER.md       # AWS EC2 deployment recipe
+│       ├── harvest_bitfinex_l3.py    # live WS harvester (Bitfinex `book` R0 + `trades`)
+│       ├── probe_bitfinex_ws.py      # diagnostic WS probe
+│       ├── aggregate_mbo_events.py   # event-clock aggregator + OrderEvent schema
+│       └── download_tardis_l3_free.py  # Tardis client (paid-only; preserved for record)
 │
 ├── docs/                     # design + research write-ups
 │   ├── IMPLEMENTATION.md         # architecture rationale and runbooks
 │   ├── LAYER2_TRAINING.md        # TCN training research log
-│   ├── L3_RESEARCH_PLAN.md       # strategic plan for L3 pivot
 │   ├── EXECUTION_TRAINING.md     # Layer 3/4 training + validation findings
 │   └── TODO.md                   # deferred work (P0–P6)
 │
@@ -484,9 +491,9 @@ Only then flip `SHADOW_MODE=False` and `EXCHANGE_LIVE=true`.
 ## Open work / collaboration
 
 The L2 chapter is closed. The dominant open frontier is the L3 pivot.
-Three concrete pieces that someone clone-and-explore could pick up:
+Three concrete pieces that a clone-and-explore reader could pick up:
 
-### 1. L3 (order-by-order) microstructure data pivot — the new frontier
+### 1. L3 (order-by-order) microstructure — the new frontier
 
 L2 snapshot-based features (Path D: CE ratio, OBI, MLOFI, VAMP, Kyle's λ)
 were exhaustively tested and shown to carry real but magnitude-insufficient
@@ -498,59 +505,73 @@ queue dynamics that *precede* book-state changes (order arrivals,
 cancellations, modifications, hidden-order inference from price-improvement
 events, order lifespan distributions) are aggregated away by L2 snapshots.
 
-What L3 requires:
+The Path H L3 pipeline lives at
+[research/path_h_l3/](research/path_h_l3/) — see that directory's
+README for the venue decision (Bitfinex public WS), the live harvester,
+the event-clock aggregator, and the phased work to wire L3 features
+into the existing TCN/training stack. Strategic plan (feature
+candidates, success criteria, decision gates) in
+[research/path_h_l3/L3_RESEARCH_PLAN.md](research/path_h_l3/L3_RESEARCH_PLAN.md).
 
-1. **Data source.** Hyperliquid's S3 archive is L2-only as far as
-   verified; need (a) an L3-emitting venue with a public archive
-   (Binance tick data, Coinbase Advanced order-by-order, Databento for
-   futures), (b) live L3 capture forward from the WebSocket feed, or
-   (c) reconstruction from delta-stream data if accessible.
-2. **New sensor classes in `layer1_sensors.py`** that consume *order
-   events*, not snapshots: per-side cancellation rate, order-lifespan
-   distribution, queue-position evolution, hidden-order inference,
-   trade-aggressor sequencing. Path G's `BOUNDARY_CONDITIONS.md`
-   already noted that the discrete quantum of market data is the
-   order-event, not the snapshot.
+In summary:
+
+1. **Data source — resolved.** Coinbase Exchange `full` channel went
+   HMAC-auth only in early 2026; retail Exchange signup closed; Tardis
+   paid-only. Bitfinex's public `book(prec=R0)` + `trades` channels
+   are the working free L3 source. Live capture only — no historical
+   archive — so the active capture is gating Phase 1.
+2. **New sensor classes** consume *order events*, not snapshots:
+   per-side cancellation rate, order-lifespan distribution,
+   queue-position evolution, hidden-order inference, trade-aggressor
+   sequencing. Will live in `layer1_l3_sensors.py` at the project root
+   (separate from `layer1_sensors.py` since the input contract
+   differs). Path G's `BOUNDARY_CONDITIONS.md` discipline applies
+   directly — event-rate quantities have wider dynamic range than
+   snapshot ratios.
 3. **Replacement TCN feature stack.** Path D's 5 channels become a
    small subset of the new stack; `TCN_INPUT_CHANNELS` likely grows
-   to 10-20. Calibration and training infrastructure (`calibration.py`,
-   `train_stream.py`, `backtest_directional.py`) carries over with
-   schema extensions.
+   to 10–15 via a new `TCN_L3_INPUT_CHANNELS` constant + a
+   `LAYER1_MODE` env-overridable flag.  Calibration and training
+   infrastructure (`calibration.py`, `training/train_stream.py`,
+   `training/backtest_directional.py`) carries over with schema
+   extensions.
 4. **L2 codebase frozen as reference baseline.** Anything L3 builds
    must beat F2=0.106 (in-domain, temporal val) and 0.06 bps gross
    directional edge per trade.
 
-### 2. Layer 3 PPO — training infrastructure shipped (2026-05-11)
+### 2. Layer 3 PPO — training infrastructure
 
 The execution agent (`layer3_execution.py`) is structurally complete — full
 `ExecutionEnv`, `PPOAgent` with split CNN encoders, `PPOTrainer` with GAE,
-clipped surrogate, and entropy regularization. As of 2026-05-11, an offline
-training driver (`train_ppo.py`) and held-out baseline comparator
-(`eval_ppo.py`) ship alongside; `engine.py` now boots with optional
+clipped surrogate, and entropy regularization. An offline training driver
+(`training/train_ppo.py`) and held-out baseline comparator
+(`training/eval_ppo.py`) ship alongside; `engine.py` boots with optional
 `PPO_LIVE_CHECKPOINT` load and mirrors the live agent into the shadow
-agent so initial KL ≈ 0. See [EXECUTION_TRAINING.md](docs/EXECUTION_TRAINING.md)
-for the protocol, baseline-comparison gate, and training-divergence
-discussion specific to the L2 mandate stream.
+agent so initial KL ≈ 0. See
+[docs/EXECUTION_TRAINING.md](docs/EXECUTION_TRAINING.md) for the protocol,
+baseline-comparison gate, and training-divergence discussion specific to
+the L2 mandate stream.
 
-Open subproblem still: a regime-keyed checkpoint flow. Naive load-on-boot
-would push yesterday-trained-on-Turbulent weights into a Laminar morning.
+Open subproblem: a regime-keyed checkpoint flow. Naive load-on-boot
+would push weights trained on a Turbulent regime into a Laminar morning.
 The right abstraction is regime-keyed checkpoints (load the weights
-matching today's opening regime), but that requires a regime-classification
-step before the TCN buffer warms up. The current boot path loads a single
-checkpoint regardless of regime.
+matching the opening regime), but that requires a regime-classification
+step before the TCN buffer warms up. The current boot path loads a
+single checkpoint regardless of regime.
 
-### 3. Eval harness — wired (2026-05-11)
+### 3. Eval harness — wired
 
-`hpo.py` defines the Optuna study over `(η, γ_inv, terminal_mult)` with
-holdout validation. The provider stubs were replaced with
+`training/hpo.py` defines the Optuna study over `(η, γ_inv, terminal_mult)`
+with holdout validation. The provider stubs were replaced with
 `make_csv_data_provider(csv_path, symbol, start_frac, end_frac)`, which
 streams a fractional slice of a `feature_history` CSV through the same
-ReplaySensorArray + AlphaEngine stack used by `train_ppo.py`. Each HPO
-trial trains a fresh PPO under the candidate `(η, γ_inv, terminal_mult)`
-on the train slice and evaluates on the eval/holdout slices. Invocation:
+ReplaySensorArray + AlphaEngine stack used by `training/train_ppo.py`.
+Each HPO trial trains a fresh PPO under the candidate `(η, γ_inv,
+terminal_mult)` on the train slice and evaluates on the eval/holdout
+slices. Invocation:
 
 ```powershell
-python hpo.py --n-trials 3 `
+python training/hpo.py --n-trials 3 `
     --csv calibration/feature_history_TSLA_balanced.csv --symbol TSLA
 ```
 
