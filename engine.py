@@ -308,12 +308,27 @@ class Engine:
         # Live and shadow agents.
         self.live_agent = PPOAgent()
         self.shadow_agent = PPOAgent()
+        ppo_ckpt = Path(config.PPO_LIVE_CHECKPOINT) if config.PPO_LIVE_CHECKPOINT else None
+        if ppo_ckpt and ppo_ckpt.exists():
+            try:
+                state = torch.load(ppo_ckpt, map_location="cpu")
+                self.live_agent.load_state_dict(state)
+                log.info("Loaded PPO live-agent weights from %s", ppo_ckpt)
+            except Exception as e:
+                log.warning("PPO checkpoint at %s failed to load (%s); live agent stays random-init", ppo_ckpt, e)
+        else:
+            log.info("no PPO checkpoint at %s; live agent remains random-init", ppo_ckpt)
+        # Mirror live → shadow so initial KL is ~0 (stability gate's KL check
+        # is satisfied immediately; shadow's drift is bounded by replay-buffer
+        # training going forward).
         self.shadow_agent.load_state_dict(self.live_agent.state_dict())
 
+        shadow_train_interval = float(os.environ.get("SHADOW_TRAIN_INTERVAL_SEC", "30.0"))
         self.shadow_sim = ShadowSimulator(
             live_agent=self.live_agent,
             shadow_agent=self.shadow_agent,
             live_regime_provider=lambda: self.sensors.state.regime,
+            train_interval_sec=shadow_train_interval,
         )
 
         # Drift monitor — current_c sourced from calibration registry.

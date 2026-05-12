@@ -56,6 +56,13 @@ FEATURE_DUMP_PATH = f"./calibration/feature_history_{SYMBOL_SLUG}_balanced.csv"
 OOD_CALIBRATION_PATH = f"./calibration/latest_{SYMBOL_SLUG}.json"
 TCN_WEIGHTS_PATH = f"./calibration/tcn_weights_{SYMBOL_SLUG}.pt"
 TCN_THRESHOLD_PATH = f"./calibration/tcn_threshold_{SYMBOL_SLUG}.json"
+# Optional PPO live-agent checkpoint loaded at engine boot. Mirrored into
+# the shadow agent (initial KL ≈ 0) so Layer 4 has a non-random starting
+# point. Produced by train_ppo.py.
+PPO_LIVE_CHECKPOINT = os.environ.get(
+    "PPO_LIVE_CHECKPOINT",
+    f"./calibration/ppo_weights_{SYMBOL_SLUG}.pt",
+)
 
 # Credentials are read at runtime, never hardcoded.
 EXCHANGE_API_KEY = os.environ.get("EXCHANGE_API_KEY", "")
@@ -288,18 +295,23 @@ EXECUTION_HARD_STOP_MULTIPLIER = 1.5   # Cancel limit orders after window * 1.5
 # ============================================================================
 # HPO
 # ============================================================================
-HPO_TRAIN_STEPS = 500_000
-HPO_DEGRADATION_THRESHOLD = 0.20
+HPO_TRAIN_STEPS = int(os.environ.get("HPO_TRAIN_STEPS", "500000"))
+HPO_DEGRADATION_THRESHOLD = float(os.environ.get("HPO_DEGRADATION_THRESHOLD", "0.20"))
 HPO_VALIDATION_HOURS = 6
-HPO_N_TRIALS = 50
+HPO_N_TRIALS = int(os.environ.get("HPO_N_TRIALS", "50"))
 
 # ============================================================================
 # Layer 4 — Shadow simulator
 # ============================================================================
 POLYAK_TAU = 0.05
-KL_THRESHOLD = 0.1
-MIN_SHADOW_STEPS = 50_000
-REPLAY_BUFFER_HOURS = 24
+# Production default 0.1. Validation harnesses may relax this to confirm
+# promotion flow under realistic drift.
+KL_THRESHOLD = float(os.environ.get("KL_THRESHOLD", "0.1"))
+# Production default 50,000 gradient steps before the gate's step-condition
+# clears. Env-overridable for validation harnesses that need to observe a
+# promotion in bounded wall time (see validate_layer4.py).
+MIN_SHADOW_STEPS = int(os.environ.get("MIN_SHADOW_STEPS", "50000"))
+REPLAY_BUFFER_HOURS = float(os.environ.get("REPLAY_BUFFER_HOURS", "24"))
 SHADOW_PARALLEL_ENVS = 8
 
 # ============================================================================

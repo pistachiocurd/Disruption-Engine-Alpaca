@@ -13,10 +13,14 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import sys
 from pathlib import Path
 
-import config
-from train_tcn import build_labels, load_csv
+_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(_ROOT))
+
+import config  # noqa: E402
+from train_tcn import build_labels, load_csv  # noqa: E402  (sibling)
 
 
 def main() -> None:

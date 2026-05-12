@@ -34,6 +34,10 @@ from pathlib import Path
 ROOT = Path(__file__).parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
+# train_tcn lives in training/ after the 2026-05-11 reorg.
+_TRAINING = ROOT / "training"
+if str(_TRAINING) not in sys.path:
+    sys.path.insert(0, str(_TRAINING))
 
 import numpy as np
 import polars as pl

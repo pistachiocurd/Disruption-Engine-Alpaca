@@ -36,9 +36,12 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, TensorDataset
 
-import config
-from calibration import identify_shock_events
-from layer2_alpha import TCNSpikePredictor
+_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(_ROOT))
+
+import config  # noqa: E402
+from calibration import identify_shock_events  # noqa: E402
+from layer2_alpha import TCNSpikePredictor  # noqa: E402
 
 
 # ----------------------------------------------------------------------------

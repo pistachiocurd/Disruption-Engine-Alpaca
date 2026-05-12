@@ -85,5 +85,15 @@ calibration/hl_liquidations.csv
 # are committed; backups like _H100.pt, _H500.pt are local-only).
 calibration/tcn_weights_*_H*.pt
 
+# PPO step-checkpoints from train_ppo.py — only the final ppo_weights_<SYM>.pt
+# and the random-init sanity baseline are worth tracking; intermediate step
+# files are noise.
+calibration/ppo_weights_*_step*.pt
+# Per-run training log + eval/HPO/Layer-4 report JSON — outputs, not source.
+calibration/ppo_train_log_*.csv
+calibration/eval_ppo_*.json
+calibration/hpo_smoke_*.json
+calibration/layer4_validation_*.json
+
 # Claude Code session metadata (worktrees, agent state).
 .claude/

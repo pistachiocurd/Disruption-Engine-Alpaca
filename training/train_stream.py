@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from pathlib import Path
 
 import numpy as np
@@ -42,9 +43,12 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import IterableDataset, DataLoader
 
-import config
-from layer2_alpha import MambaSpikePredictor, TCNSpikePredictor, TransformerSpikePredictor
-from train_tcn import build_labels
+_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(_ROOT))
+
+import config  # noqa: E402
+from layer2_alpha import MambaSpikePredictor, TCNSpikePredictor, TransformerSpikePredictor  # noqa: E402
+from train_tcn import build_labels  # noqa: E402  (sibling in training/)
 
 # LibAUC provides AUCMLoss + PESG optimizer for direct AUC optimization
 # under extreme class imbalance — the recommended remediation per Gemini

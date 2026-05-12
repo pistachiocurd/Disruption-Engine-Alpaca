@@ -6,7 +6,7 @@ condition for picking it back up, and rough effort estimate.
 
 For higher-level open frontiers (PPO checkpoint persistence, eval harness
 data providers, replay session-boundary detection) see [README.md "Open
-work / collaboration"](README.md). For research-grade findings to
+work / collaboration"](../README.md). For research-grade findings to
 implement (BC warm-start, SAC migration, RevIN, etc.) see §A/§B/§C of the
 deep-research review (synthesized in this session, in the plan file at
 `~/.claude/plans/fresh-session-i-want-deep-lake.md`).

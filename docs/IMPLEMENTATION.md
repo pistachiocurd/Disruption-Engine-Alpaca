@@ -489,18 +489,18 @@ For the equities path the engine ships a same-day pipeline driven by
 ```powershell
 # 1. Replay 14 trading sessions through the live SensorArray code path,
 #    writing the canonical 9-column feature_history CSV.
-python fetch_history_alpaca.py --symbol NVDA --days 14
+python harvesters/fetch_history_alpaca.py --symbol NVDA --days 14
 
 # 2. Verify shock density.
-python check_shocks.py
+python training/check_shocks.py
 
 # 3. Fit OOD μ, Σ over [ce_ratio, obi, liquidation_rate] from the CSV.
 #    Writes calibration/latest_NVDA.json.
-python fit_ood_from_csv.py
+python training/fit_ood_from_csv.py
 
 # 4. Train the TCN supervised against shock labels derived from the same
 #    CSV. Writes calibration/tcn_weights_NVDA.pt and tcn_threshold_NVDA.json.
-python train_tcn.py
+python training/train_tcn.py
 ```
 
 The harvester drives `SensorArray._process_*` directly so the CSV is
@@ -726,16 +726,24 @@ training data that the codebase scaffolds but doesn't ship:
   pre-labelled state sequence. Producing those labels (offline EM or a
   hand-tuned heuristic) is the operator's job. The default priors in
   `StudentTHMM.from_default_priors()` are a cold-start placeholder.
-- **`hpo.run_hpo`** requires `train_data_provider`, `eval_data_provider`,
-  `holdout_data_provider` callables. The real implementations stream
-  archived L2 data + replayed mandates from disk; that I/O glue is a one-
-  time write specific to the operator's data lake.
+- **`hpo.run_hpo`** is now wired via `make_csv_data_provider(csv_path, symbol,
+  start_frac, end_frac)` (see hpo.py `__main__`). The CSV streamer
+  delivers `(mandate, env, state_advancer)` tuples to `evaluate_objective`
+  and `_run_episode` drives the env tick-by-tick. A real HPO study still
+  needs ≥1 week of mandates per slice (train / eval / holdout); the
+  default `--n-trials 3` invocation is for plumbing verification only.
 - **TCN training data.** The TCN ships with random-init weights; it must
   be supervised-trained on labeled shock events from the calibration
   dataset before mandate generation produces a tradeable signal. The
   recommended target is the same `T_actual` proxy used by the heat solver
   calibration: positive label if a shock occurred within the next
   `MAX_DIFFUSION_TICKS`, else negative.
+- **PPO checkpoint flow.** Live and shadow PPOAgent are mirrored at engine
+  boot (initial KL ≈ 0). If `PPO_LIVE_CHECKPOINT` env var (or the default
+  `./calibration/ppo_weights_<SYMBOL>.pt`) exists, the live agent loads
+  it and the shadow agent is initialized as a copy. `train_ppo.py`
+  produces the checkpoint; `eval_ppo.py` compares it against naive
+  baselines. See [EXECUTION_TRAINING.md](EXECUTION_TRAINING.md).
 
 ---
 

@@ -24,8 +24,11 @@ from pathlib import Path
 
 import numpy as np
 
-import config
-from calibration import fit_ood_distribution, load_calibration, save_calibration
+_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(_ROOT))
+
+import config  # noqa: E402
+from calibration import fit_ood_distribution, load_calibration, save_calibration  # noqa: E402
 
 
 def _read_csv(path: Path) -> np.ndarray:

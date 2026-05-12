@@ -45,6 +45,7 @@ Usage
 from __future__ import annotations
 
 import argparse
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -52,8 +53,11 @@ import numpy as np
 import polars as pl
 import torch
 
-import config
-from layer2_alpha import TCNSpikePredictor
+_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(_ROOT))
+
+import config  # noqa: E402
+from layer2_alpha import TCNSpikePredictor  # noqa: E402
 
 DEFAULT_COINS = ["BTC", "ETH", "SOL"]
 

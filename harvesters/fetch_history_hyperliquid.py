@@ -41,8 +41,11 @@ from pathlib import Path
 from typing import Iterable, Iterator, Optional
 from urllib.request import urlretrieve
 
-import config
-from layer1_sensors import FeatureDumper, SensorArray, StudentTHMM
+_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(_ROOT))
+
+import config  # noqa: E402
+from layer1_sensors import FeatureDumper, SensorArray, StudentTHMM  # noqa: E402
 
 logging.basicConfig(
     level=getattr(logging, config.LOG_LEVEL, logging.INFO),

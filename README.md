@@ -5,7 +5,7 @@
 > Kyle's λ) carries real directional signal (~55% paper accuracy at H=100
 > ticks) but at magnitudes too small to overcome maker+taker execution
 > costs: gross edge ≈ 0.06 bps per trade vs round-trip cost ≈ 5.5 bps.
-> Full Phase A backtest in [LAYER2_TRAINING.md §14.7-§14.8](LAYER2_TRAINING.md).
+> Full Phase A backtest in [LAYER2_TRAINING.md §14.7-§14.8](docs/LAYER2_TRAINING.md).
 > **Next research generation pivots to L3 (order-by-order) microstructure
 > data** — queue depletion, cancellation velocity, order lifespan — which
 > L2 snapshots aggregate away. Codebase preserved as the L2 reference
@@ -80,7 +80,7 @@ flowchart TD
 ```
 
 (Full topology with WebSocket sources, calibration loops, and per-task
-asyncio cadences in [IMPLEMENTATION.md §1](IMPLEMENTATION.md).)
+asyncio cadences in [IMPLEMENTATION.md §1](docs/IMPLEMENTATION.md).)
 
 **Primary target: US equities via Alpaca** (NVDA by default; SPY also
 supported). The original crypto path (Coinbase Advanced spot, optional
@@ -114,14 +114,14 @@ $env:SYMBOL = "NVDA"
 #    CSV that is byte-identical to what the live FeatureDumper writes. This
 #    drives the actual SensorArray code path on historical Alpaca data so
 #    you can train the TCN today instead of waiting for live capture.
-python fetch_history_alpaca.py --symbol NVDA --days 14
+python harvesters/fetch_history_alpaca.py --symbol NVDA --days 14
 
 # 7. Verify enough shock events were captured, fit OOD, train the TCN.
 #    Use train_tcn.py for harvests that fit in RAM, train_stream.py for
 #    multi-GB streams (also auto-tunes the engine threshold from a sweep).
-python check_shocks.py
-python fit_ood_from_csv.py
-python train_tcn.py        # or: python train_stream.py
+python training/check_shocks.py
+python training/fit_ood_from_csv.py
+python training/train_tcn.py        # or: python training/train_stream.py
 
 # 8. Live shadow-mode smoke test (during market hours).
 python engine.py
@@ -199,22 +199,22 @@ symbols.
 ```powershell
 # 1. Harvest history. Replays trades + quotes through the live SensorArray
 #    code path so the CSV is byte-identical to live FeatureDumper output.
-python fetch_history_alpaca.py --symbol NVDA --days 14
+python harvesters/fetch_history_alpaca.py --symbol NVDA --days 14
 
 # 2. Verify shock count.
-python check_shocks.py
+python training/check_shocks.py
 
 # 3. Fit OOD distribution; writes calibration/latest_NVDA.json.
-python fit_ood_from_csv.py
+python training/fit_ood_from_csv.py
 
 # 4a. Train the TCN — in-memory path, fine for harvests up to ~1 GB.
 #     Writes calibration/tcn_weights_NVDA.pt + tcn_threshold_NVDA.json.
-python train_tcn.py
+python training/train_tcn.py
 
 # 4b. ...or use the streaming trainer for multi-GB harvests. Same outputs;
 #     also runs a post-train threshold sweep and writes the full
 #     precision/recall/F1 curve to tcn_threshold_sweep_NVDA.csv.
-python train_stream.py
+python training/train_stream.py
 ```
 
 `train_stream.py` differs from `train_tcn.py` in three ways: (1) it
@@ -239,13 +239,13 @@ premise that a missed shock costs more than a wasted mandate).
 
 ```powershell
 # Re-pick the threshold from existing weights — no retraining (~30s).
-python train_stream.py --tune-only
+python training/train_stream.py --tune-only
 
 # Switch criteria without retraining:
-python train_stream.py --tune-only --threshold-criterion f1
-python train_stream.py --tune-only --threshold-criterion min-precision --min-precision 0.75
-python train_stream.py --tune-only --threshold-criterion min-recall --min-recall 0.70
-python train_stream.py --tune-only --threshold-criterion fbeta --beta 3.0
+python training/train_stream.py --tune-only --threshold-criterion f1
+python training/train_stream.py --tune-only --threshold-criterion min-precision --min-precision 0.75
+python training/train_stream.py --tune-only --threshold-criterion min-recall --min-recall 0.70
+python training/train_stream.py --tune-only --threshold-criterion fbeta --beta 3.0
 ```
 
 Available criteria: `f1`, `fbeta` (default, with `--beta 2.0`),
@@ -265,10 +265,10 @@ the current `SYMBOL` is never clobbered by a diagnostic run.
 
 ```powershell
 # Temporal hold-out (different week, same symbol).
-python train_stream.py --tune-only --val-csv calibration/feature_history_NVDA_holdout.csv
+python training/train_stream.py --tune-only --val-csv calibration/feature_history_NVDA_holdout.csv
 
 # Cross-symbol generalization (NVDA-trained → PLTR raw harvest).
-python train_stream.py --tune-only --val-csv calibration/feature_history_PLTR.csv
+python training/train_stream.py --tune-only --val-csv calibration/feature_history_PLTR.csv
 ```
 
 Cross-symbol F1 will be materially lower than train-set F1 — that's
@@ -283,7 +283,7 @@ and what the model can and can't train on. Full discussion — including
 the two distinct "loss not improving" failure modes, observed positive-
 class density thresholds, per-symbol training results, cross-symbol
 generalization tables, and IEX-feed sparsity by symbol — lives in
-[`LAYER2_TRAINING.md`](LAYER2_TRAINING.md).
+[`LAYER2_TRAINING.md`](docs/LAYER2_TRAINING.md).
 
 | Symbol | Source | Sessions | Rows | Pos rate after H=30 | Trainable directly? |
 |---|---|---|---|---|---|
@@ -320,7 +320,7 @@ signal decays past ~100 ticks). The L2 feature set carries genuine
 but magnitude-insufficient predictive information. Path forward is
 L3 (order-by-order) data, where the queue dynamics that L2
 aggregates destroy may survive at tradeable magnitude. Detailed
-write-up: [LAYER2_TRAINING.md §14.7-§14.8](LAYER2_TRAINING.md).
+write-up: [LAYER2_TRAINING.md §14.7-§14.8](docs/LAYER2_TRAINING.md).
 
 ## File layout
 
@@ -335,34 +335,61 @@ disruption_arbitrage_engine/
 ├── layer4_shadow.py          # ShadowSimulator, stability gate, Polyak update
 ├── matching_engine.py        # LocalMatchingEngine — paper fills
 ├── calibration.py            # shock identification, EWLS, drift monitor, OOD fit
-├── fetch_history_alpaca.py   # historical harvester for the equities path
-├── train_tcn.py              # supervised TCN training (in-memory)
-├── train_stream.py           # streaming TCN trainer + threshold sweep
-├── check_shocks.py           # validates feature_history shock density
-├── fit_ood_from_csv.py       # offline OOD μ, Σ fit from feature_history
-├── hpo.py                    # Optuna HPO over reward weights
-├── synthetic_data.py         # synthetic feature_history generator
 ├── config.py                 # all hyperparameters + CALIBRATION_REGISTRY
-├── requirements.txt
+├── dashboard.py + dashboard.html
 ├── README.md                 # this file
-├── IMPLEMENTATION.md         # full architectural rationale and runbooks
-├── LAYER2_TRAINING.md        # TCN training research log: data, densities, results
-└── tests/  (top-level test_*.py files, not a package)
-    ├── test_features.py           # feature predictability diagnostic (KS-test
-    │                              #   pre-shock vs random windows; tells you
-    │                              #   whether the signal is in the data before
-    │                              #   chasing label/loss/data-volume tweaks)
-    ├── inspect_hl_liquidations.py # diagnostic: scan HL trade archive for
-    │                              #   `dir` values, identify the liquidation
-    │                              #   marker before wiring a venue adapter
+├── requirements.txt
+│
+├── training/                 # offline training + eval + HPO entry-points
+│   ├── train_tcn.py              # supervised TCN training (in-memory)
+│   ├── train_stream.py           # streaming TCN trainer + threshold sweep
+│   ├── train_ppo.py              # offline Layer 3 PPO trainer (uses replay CSV)
+│   ├── eval_ppo.py               # held-out PPO vs naive-baseline comparison
+│   ├── validate_layer4.py        # end-to-end Layer 4 shadow-trainer validation
+│   ├── check_shocks.py           # validates feature_history shock density
+│   ├── check_shocks_polars.py    # polars-streaming variant
+│   ├── fit_ood_from_csv.py       # offline OOD μ, Σ fit from feature_history
+│   ├── hpo.py                    # Optuna HPO over reward weights (CSV providers)
+│   └── backtest_directional.py   # §14.7 Phase A directional backtest
+│
+├── harvesters/               # historical-data ingestion
+│   ├── fetch_history_alpaca.py       # equity NBBO + trades (Alpaca)
+│   ├── fetch_history_hyperliquid.py  # HL perp trades + book (S3 archive)
+│   └── synthetic_data.py             # synthetic feature_history generator
+│
+├── research/                 # parked / experimental work
+│   └── path_g/                   # dimensionless features (Buckingham-π)
+│       ├── recompute_path_g_pi_groups.py
+│       ├── calibrate_path_g_scales.py
+│       └── check_path_g_distributions.py
+│
+├── docs/                     # design + research write-ups
+│   ├── IMPLEMENTATION.md         # architecture rationale and runbooks
+│   ├── LAYER2_TRAINING.md        # TCN training research log
+│   ├── L3_RESEARCH_PLAN.md       # strategic plan for L3 pivot
+│   ├── EXECUTION_TRAINING.md     # Layer 3/4 training + validation findings
+│   └── TODO.md                   # deferred work (P0–P6)
+│
+└── tests/                    # pytest suite + diagnostic scripts
+    ├── conftest.py                # sys.path bootstrap for tests
+    ├── test_features.py           # feature predictability diagnostic
     ├── test_sensors.py            # layer1 unit tests
     ├── test_calibration.py        # calibration helpers
     ├── test_matching_engine.py    # LocalMatchingEngine + structural isolation
     ├── test_alpha.py              # AlphaEngine mandate gates
     ├── test_execution.py          # ExecutionEnv + PPO contract
-    ├── test_engine.py             # Engine risk gates: drawdown (IS+MTM), position limit, session reset
-    └── test_replay.py             # ReplaySensorArray shim + replay-mode pytest cases
+    ├── test_engine.py             # Engine risk gates: drawdown, position, session
+    ├── test_replay.py             # ReplaySensorArray shim + replay pytest cases
+    ├── inspect_hl_liquidations.py # diagnostic (not a pytest)
+    ├── inspect_shocks.py          # diagnostic (not a pytest)
+    └── diagnose_tcn.py            # diagnostic (not a pytest)
 ```
+
+**Invocation convention.** All `training/`, `harvesters/`, and `research/path_g/`
+scripts insert the repo root into `sys.path` at startup, so `python
+training/train_ppo.py ...` or `python harvesters/fetch_history_alpaca.py ...`
+works from the repo root. Run scripts from the repo root so the default
+`./calibration/...` paths resolve correctly.
 
 ## Safety constraints
 
@@ -463,7 +490,7 @@ Three concrete pieces that someone clone-and-explore could pick up:
 
 L2 snapshot-based features (Path D: CE ratio, OBI, MLOFI, VAMP, Kyle's λ)
 were exhaustively tested and shown to carry real but magnitude-insufficient
-directional signal (see [LAYER2_TRAINING.md §14.7-§14.8](LAYER2_TRAINING.md)).
+directional signal (see [LAYER2_TRAINING.md §14.7-§14.8](docs/LAYER2_TRAINING.md)).
 The architectural premise — that *snapshots of book state* contain enough
 information to predict shocks or tradeable directional moves — is
 empirically falsified at this venue/time-resolution combination. The
@@ -493,31 +520,43 @@ What L3 requires:
    must beat F2=0.106 (in-domain, temporal val) and 0.06 bps gross
    directional edge per trade.
 
-### 2. (Frozen, pending L3 architecture) Layer 3 PPO
+### 2. Layer 3 PPO — training infrastructure shipped (2026-05-11)
 
 The execution agent (`layer3_execution.py`) is structurally complete — full
 `ExecutionEnv`, `PPOAgent` with split CNN encoders, `PPOTrainer` with GAE,
-clipped surrogate, and entropy regularization — but it is **random-init at
-every session start**, and the L2 mandate it was built to consume is no
-longer the active alpha generator. Resuming PPO development is gated on
-the L3 architecture defining a new mandate shape (likely continuous
-inventory skew + confidence rather than discrete IS-targeted execution).
+clipped surrogate, and entropy regularization. As of 2026-05-11, an offline
+training driver (`train_ppo.py`) and held-out baseline comparator
+(`eval_ppo.py`) ship alongside; `engine.py` now boots with optional
+`PPO_LIVE_CHECKPOINT` load and mirrors the live agent into the shadow
+agent so initial KL ≈ 0. See [EXECUTION_TRAINING.md](docs/EXECUTION_TRAINING.md)
+for the protocol, baseline-comparison gate, and training-divergence
+discussion specific to the L2 mandate stream.
 
-Specific open problem: a saved-and-loadable PPO checkpoint flow that
-respects the regime-match assumption. Naive load-on-boot would push
-yesterday-trained-on-Turbulent weights into a Laminar morning. The right
-abstraction is regime-keyed checkpoints (load the weights matching today's
-opening regime), but that requires a regime-classification step before the
-TCN buffer warms up. Open design question.
+Open subproblem still: a regime-keyed checkpoint flow. Naive load-on-boot
+would push yesterday-trained-on-Turbulent weights into a Laminar morning.
+The right abstraction is regime-keyed checkpoints (load the weights
+matching today's opening regime), but that requires a regime-classification
+step before the TCN buffer warms up. The current boot path loads a single
+checkpoint regardless of regime.
 
-### 3. Eval harness needs hooking
+### 3. Eval harness — wired (2026-05-11)
 
 `hpo.py` defines the Optuna study over `(η, γ_inv, terminal_mult)` with
-holdout validation, but the data-provider callables
-(`train_data_provider`, `eval_data_provider`, `holdout_data_provider`) are
-stubs (see `IMPLEMENTATION.md §9`). Producing a real archived-mandate
-replay stream is a one-time write specific to whoever has the data lake —
-not hard, just unwritten.
+holdout validation. The provider stubs were replaced with
+`make_csv_data_provider(csv_path, symbol, start_frac, end_frac)`, which
+streams a fractional slice of a `feature_history` CSV through the same
+ReplaySensorArray + AlphaEngine stack used by `train_ppo.py`. Each HPO
+trial trains a fresh PPO under the candidate `(η, γ_inv, terminal_mult)`
+on the train slice and evaluates on the eval/holdout slices. Invocation:
+
+```powershell
+python hpo.py --n-trials 3 `
+    --csv calibration/feature_history_TSLA_balanced.csv --symbol TSLA
+```
+
+A full N=50 study still requires real archived L2 mandate data and
+appropriate compute — the smoke-test invocation above is for plumbing
+verification only.
 
 ### 4. Replay session-boundary detection
 
@@ -528,7 +567,7 @@ A timestamp-gap detector that triggers `_reset_session_risk_state` would
 let the production caps work in replay too — small change, fully isolated
 to `test_replay.py`.
 
-These are described more deeply in [LAYER2_TRAINING.md §11](LAYER2_TRAINING.md);
+These are described more deeply in [LAYER2_TRAINING.md §11](docs/LAYER2_TRAINING.md);
 that document is also the source of truth for what's been calibrated, what
 the cross-symbol generalization looks like, and what claims this project
 will and will not make.

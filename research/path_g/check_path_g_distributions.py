@@ -12,6 +12,9 @@ import csv
 import sys
 from pathlib import Path
 
+_ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(_ROOT))
+
 DEFAULT_COINS = ["BTC", "ETH", "SOL", "HYPE"]
 PI_COLS = ["fo_market", "sr", "pi_kappa", "pi_vamp_dim"]
 
@@ -31,7 +34,7 @@ def main(coins):
     )
     print("-" * 80)
     for c in coins:
-        p = Path(f"./calibration/feature_history_{c}.csv")
+        p = _ROOT / "calibration" / f"feature_history_{c}.csv"
         if not p.exists():
             print(f"{c}: missing")
             continue

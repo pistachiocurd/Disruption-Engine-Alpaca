@@ -22,8 +22,12 @@ import os
 import sys
 from pathlib import Path
 
-from layer1_sensors import PATH_G_TANH_SCALES  # type: ignore
-from config import EPSILON  # type: ignore
+# Allow running from anywhere; resolve repo root from this file's location.
+_ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(_ROOT))
+
+from layer1_sensors import PATH_G_TANH_SCALES  # type: ignore  # noqa: E402
+from config import EPSILON  # type: ignore  # noqa: E402
 
 DEFAULT_COINS = ["BTC", "ETH", "SOL", "HYPE"]
 
@@ -36,7 +40,7 @@ def main(coins):
     print(f"Using PATH_G_TANH_SCALES: fo={fo_s} sr={sr_s} pk={pk_s} pv={pv_s}\n")
 
     for c in coins:
-        in_path = Path(f"./calibration/feature_history_{c}.csv")
+        in_path = _ROOT / "calibration" / f"feature_history_{c}.csv"
         if not in_path.exists():
             print(f"{c}: missing ({in_path})")
             continue
