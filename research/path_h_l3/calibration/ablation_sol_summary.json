@@ -1,0 +1,141 @@
+﻿{
+    "baseline_bps":  11.56,
+    "config":  "SOL H=300 thr=0.95 fees=10maker/20taker bps q=1.0",
+    "note":  "Inference-time channel zeroing on Phase 2 per-symbol weights. Drop = baseline - ablated_bps. Higher drop = more load-bearing.",
+    "n_channels":  19,
+    "ranking":  [
+                    {
+                        "channel":  "lifespan_ask_p50_ms",
+                        "net_bps":  -38.4,
+                        "drop_from_baseline_bps":  49.96,
+                        "n_trades":  189,
+                        "win_pct":  23.8
+                    },
+                    {
+                        "channel":  "lifespan_bid_p50_ms",
+                        "net_bps":  -22.93,
+                        "drop_from_baseline_bps":  34.49,
+                        "n_trades":  1044,
+                        "win_pct":  20.1
+                    },
+                    {
+                        "channel":  "hidden_trade_rate",
+                        "net_bps":  -17.63,
+                        "drop_from_baseline_bps":  29.19,
+                        "n_trades":  544,
+                        "win_pct":  27.9
+                    },
+                    {
+                        "channel":  "event_density_per_s",
+                        "net_bps":  -0.33,
+                        "drop_from_baseline_bps":  11.89,
+                        "n_trades":  487,
+                        "win_pct":  44.4
+                    },
+                    {
+                        "channel":  "queue_depletion_bid_per_s",
+                        "net_bps":  0.53,
+                        "drop_from_baseline_bps":  11.03,
+                        "n_trades":  477,
+                        "win_pct":  47.8
+                    },
+                    {
+                        "channel":  "queue_depletion_ask_per_s",
+                        "net_bps":  1.15,
+                        "drop_from_baseline_bps":  10.41,
+                        "n_trades":  453,
+                        "win_pct":  46.8
+                    },
+                    {
+                        "channel":  "top_bid_size",
+                        "net_bps":  1.74,
+                        "drop_from_baseline_bps":  9.82,
+                        "n_trades":  390,
+                        "win_pct":  49.2
+                    },
+                    {
+                        "channel":  "depth_imbalance_top5",
+                        "net_bps":  9.15,
+                        "drop_from_baseline_bps":  2.41,
+                        "n_trades":  442,
+                        "win_pct":  52.5
+                    },
+                    {
+                        "channel":  "spread_bps",
+                        "net_bps":  10.94,
+                        "drop_from_baseline_bps":  0.62,
+                        "n_trades":  427,
+                        "win_pct":  54.8
+                    },
+                    {
+                        "channel":  "cancel_rate_ask_per_s",
+                        "net_bps":  12.42,
+                        "drop_from_baseline_bps":  -0.86,
+                        "n_trades":  361,
+                        "win_pct":  54.3
+                    },
+                    {
+                        "channel":  "arrival_rate_bid_per_s",
+                        "net_bps":  12.87,
+                        "drop_from_baseline_bps":  -1.31,
+                        "n_trades":  474,
+                        "win_pct":  55.1
+                    },
+                    {
+                        "channel":  "top_ask_size",
+                        "net_bps":  13.11,
+                        "drop_from_baseline_bps":  -1.55,
+                        "n_trades":  425,
+                        "win_pct":  56.5
+                    },
+                    {
+                        "channel":  "cancel_rate_bid_per_s",
+                        "net_bps":  16.85,
+                        "drop_from_baseline_bps":  -5.29,
+                        "n_trades":  451,
+                        "win_pct":  57.9
+                    },
+                    {
+                        "channel":  "aggressor_imbalance",
+                        "net_bps":  18.14,
+                        "drop_from_baseline_bps":  -6.58,
+                        "n_trades":  441,
+                        "win_pct":  59.2
+                    },
+                    {
+                        "channel":  "aggressor_autocorr_lag5",
+                        "net_bps":  18.66,
+                        "drop_from_baseline_bps":  -7.1,
+                        "n_trades":  265,
+                        "win_pct":  63.4
+                    },
+                    {
+                        "channel":  "arrival_rate_ask_per_s",
+                        "net_bps":  24.39,
+                        "drop_from_baseline_bps":  -12.83,
+                        "n_trades":  305,
+                        "win_pct":  64.9
+                    },
+                    {
+                        "channel":  "aggressor_autocorr_lag1",
+                        "net_bps":  27.9,
+                        "drop_from_baseline_bps":  -16.34,
+                        "n_trades":  201,
+                        "win_pct":  81.1
+                    },
+                    {
+                        "channel":  "lifespan_ask_p95_ms",
+                        "net_bps":  40.54,
+                        "drop_from_baseline_bps":  -28.98,
+                        "n_trades":  160,
+                        "win_pct":  88.1
+                    },
+                    {
+                        "channel":  "lifespan_bid_p95_ms",
+                        "net_bps":  78.24,
+                        "drop_from_baseline_bps":  -66.68,
+                        "n_trades":  84,
+                        "win_pct":  98.8
+                    }
+                ]
+}

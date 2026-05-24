@@ -19,10 +19,9 @@ Aggregated features per event-count window:
 
 Vendor-specific parsing is delegated to `parse_<vendor>_mbo(path)`
 generators. Currently stubbed pending L3_RESEARCH_PLAN.md §5 Phase 1
-data acquisition (Bitfinex public L3 archive; Databento or Tardis for
-historical replay). A `synthetic` parser reads the canonical OrderEvent
-CSV format — useful for testing the aggregation logic before vendor
-data lands.
+data acquisition (Databento or Tardis 7-day MBO slice for BTC/ETH/SOL).
+A `synthetic` parser reads our canonical OrderEvent CSV format — useful
+for testing the aggregation logic before vendor data lands.
 
 Usage:
     python aggregate_mbo_events.py --vendor synthetic \\
@@ -30,14 +29,17 @@ Usage:
         --out calibration/l3_ticks_BTC.csv \\
         --tick-events 100
 
-    python aggregate_mbo_events.py --vendor bitfinex \\
-        --in l3_data/bitfinex_l3_20260512.jsonl.gz \\
+    python aggregate_mbo_events.py --vendor databento \\
+        --in vendor_data/dbn_btcusd_20260301.dbn \\
         --out calibration/l3_ticks_BTC.csv
 """
 from __future__ import annotations
 
 import argparse
 import csv
+import gzip
+import json
+import sys
 from collections import deque
 from dataclasses import dataclass
 from enum import Enum
@@ -74,111 +76,53 @@ class OrderEvent:
 # ============================================================================
 
 class EventClockAggregator:
-    """Maintains rolling state over an MBO event stream and emits an
-    aggregated feature row every `k_events` events.
+    """Buffers OrderEvents and emits a feature snapshot every `k_events`.
 
-    Tracks per-order submit times so cancellations can be tagged with
-    their lifespan. Order IDs that fill are also removed from the live
-    set (we don't compute lifespan on fills here — fills are a different
-    signal class than cancels).
+    Phase 2: feature math lives in `L3SensorArray` (layer1_l3_sensors.py).
+    This class is now a thin event-counter that:
+      1. Forwards each event to the sensor array (which holds all state).
+      2. Tracks last_trade_price (the label source for directional training).
+      3. On every k_events-th event, returns sensor_array.snapshot() plus
+         timestamp_ms and last_trade_price as a single dict.
     """
 
-    LIFESPAN_BUFFER_LEN = 2048  # rolling window for lifespan stats
-
-    def __init__(self, k_events: int = 100):
+    def __init__(self, k_events: int = 100,
+                 sensor_array: Optional["L3SensorArray"] = None):
+        # Delayed import to avoid a circular dep when layer1_l3_sensors.py
+        # imports OrderEvent/EventType from this module.
+        from layer1_l3_sensors import L3SensorArray as _L3SensorArray
         self.k_events = k_events
-        self._order_submit_times: dict[int, int] = {}
-        self._lifespans_bid: deque[int] = deque(maxlen=self.LIFESPAN_BUFFER_LEN)
-        self._lifespans_ask: deque[int] = deque(maxlen=self.LIFESPAN_BUFFER_LEN)
-        self._window_start_ms: Optional[int] = None
-        self._window_end_ms: Optional[int] = None
+        self.sensor_array = sensor_array or _L3SensorArray()
+        self._window_end_ms: int = 0
         self._event_count: int = 0
-        self._reset_window_counts()
+        # Last observed trade price — emitted on every tick for the
+        # downstream trainer's directional label generation.
+        self._last_trade_price: float = 0.0
 
-    def _reset_window_counts(self) -> None:
-        self.cancels_bid = 0
-        self.cancels_ask = 0
-        self.arrivals_bid = 0
-        self.arrivals_ask = 0
-        self.trades_buy_agg = 0
-        self.trades_sell_agg = 0
-        self.fills_bid = 0   # someone hit our resting bid (sold to us)
-        self.fills_ask = 0   # someone lifted our resting ask (bought from us)
+    def seed_book(self, snapshot: list) -> None:
+        """Route a vendor-emitted book snapshot to the sensor array's OrderBook."""
+        self.sensor_array.seed_book(snapshot)
 
     def process(self, event: OrderEvent) -> Optional[dict]:
-        """Process one event; return aggregated tick dict if window full,
-        else None."""
-        if self._window_start_ms is None:
-            self._window_start_ms = event.timestamp_ms
+        """Forward event to sensors; emit aggregated tick every k_events."""
         self._window_end_ms = event.timestamp_ms
+        if event.event_type == EventType.TRADE and event.price > 0:
+            self._last_trade_price = event.price
 
-        if event.event_type == EventType.ADD:
-            self._order_submit_times[event.order_id] = event.timestamp_ms
-            if event.side == "buy":
-                self.arrivals_bid += 1
-            else:
-                self.arrivals_ask += 1
-
-        elif event.event_type == EventType.CANCEL:
-            submit_t = self._order_submit_times.pop(event.order_id, None)
-            if submit_t is not None:
-                lifespan_ms = event.timestamp_ms - submit_t
-                if event.side == "buy":
-                    self.cancels_bid += 1
-                    self._lifespans_bid.append(lifespan_ms)
-                else:
-                    self.cancels_ask += 1
-                    self._lifespans_ask.append(lifespan_ms)
-
-        elif event.event_type == EventType.TRADE:
-            if event.aggressor_side == "buy":
-                self.trades_buy_agg += 1
-                self.fills_ask += 1   # bought from an ask
-            elif event.aggressor_side == "sell":
-                self.trades_sell_agg += 1
-                self.fills_bid += 1   # sold to a bid
-            # Resting order is consumed (full or partial — we don't track
-            # partial state at this level of aggregation).
-            self._order_submit_times.pop(event.order_id, None)
-
-        # MODIFY events are intentionally not counted here — a modify in
-        # most vendor schemas appears as cancel + add. If a vendor emits
-        # modify as a primitive, extend this branch to update submit time
-        # for the order_id.
-
+        self.sensor_array.process(event)
         self._event_count += 1
+
         if self._event_count >= self.k_events:
             return self._emit_and_reset()
         return None
 
     def _emit_and_reset(self) -> dict:
-        duration_ms = max(self._window_end_ms - self._window_start_ms, 1)
-        duration_s = duration_ms / 1000.0
-        total_trades = self.trades_buy_agg + self.trades_sell_agg
-
-        def _mean(buf: deque) -> float:
-            return (sum(buf) / len(buf)) if buf else 0.0
-
+        snap = self.sensor_array.snapshot()
         out = {
             "timestamp_ms": self._window_end_ms,
-            "window_duration_s": duration_s,
-            "event_density_per_s": self._event_count / duration_s,
-            "arrival_rate_bid_per_s": self.arrivals_bid / duration_s,
-            "arrival_rate_ask_per_s": self.arrivals_ask / duration_s,
-            "cancel_rate_bid_per_s": self.cancels_bid / duration_s,
-            "cancel_rate_ask_per_s": self.cancels_ask / duration_s,
-            "cancel_to_fill_bid": self.cancels_bid / max(self.fills_bid, 1),
-            "cancel_to_fill_ask": self.cancels_ask / max(self.fills_ask, 1),
-            "mean_lifespan_bid_ms": _mean(self._lifespans_bid),
-            "mean_lifespan_ask_ms": _mean(self._lifespans_ask),
-            "aggressor_imbalance": (
-                (self.trades_buy_agg - self.trades_sell_agg) / max(total_trades, 1)
-            ),
+            "last_trade_price": self._last_trade_price,
+            **snap,
         }
-
-        self._reset_window_counts()
-        self._window_start_ms = None
-        self._window_end_ms = None
         self._event_count = 0
         return out
 
@@ -192,8 +136,8 @@ class EventClockAggregator:
 # ============================================================================
 
 def parse_databento_mbo(path: Path) -> Iterator[OrderEvent]:
-    """Parse a Databento MBO file. Schema TBD — depends on whether the
-    .dbn binary format or the CSV variant is acquired. STUB until data
+    """Parse a Databento MBO file. Schema TBD — depends on whether we
+    purchase the .dbn binary format or the CSV variant. STUB until data
     is acquired."""
     raise NotImplementedError(
         "Databento MBO parser not yet wired. Acquire a sample file first, "
@@ -210,27 +154,224 @@ def parse_tardis_mbo(path: Path) -> Iterator[OrderEvent]:
     )
 
 
-def parse_bitfinex_l3(path: Path) -> Iterator[OrderEvent]:
-    """Parse a gzipped JSONL stream produced by harvest_bitfinex_l3.py.
+def parse_bitfinex_l3(paths: list[Path]) -> Iterator[tuple]:
+    """Parse Bitfinex L3 raw-book + trades capture files.
 
-    Bitfinex's raw-book frames at prec=R0 are lists keyed by chanId. The
-    parser must first read all `subscribed` events at the top of the
-    stream to build the chanId → (channel, symbol) map, then partition
-    events accordingly. STUB pending Phase 1.5 wiring; see README.md."""
-    raise NotImplementedError(
-        "Bitfinex L3 parser not yet wired. Mapping:\n"
-        "  book update PRICE!=0, ORDER_ID new      -> EventType.ADD\n"
-        "  book update PRICE!=0, ORDER_ID known    -> EventType.MODIFY\n"
-        "  book update PRICE==0                    -> EventType.CANCEL\n"
-        "  trade 'te' AMOUNT>0                     -> EventType.TRADE buy-aggressor\n"
-        "  trade 'te' AMOUNT<0                     -> EventType.TRADE sell-aggressor\n"
-        "  trade 'tu'                              -> skip (duplicates 'te')\n"
-        "  hb / info / subscribed / snapshot       -> skip (seed live-orders dict at init)\n"
-    )
+    Files are gzipped JSONL produced by `harvest_bitfinex_l3.py`. Each
+    file interleaves book(R0) and trades messages for multiple symbols;
+    the chanId -> (channel, symbol) map is reconstructed from the
+    `subscribed` events at the top of every connection's stream
+    (reconnects produce fresh chanIds, also captured).
+
+    Yields TAGGED tuples (Phase 2 contract):
+        ("event",    symbol, OrderEvent)   -- normal ADD/MODIFY/CANCEL/TRADE
+        ("snapshot", symbol, snapshot_list) -- vendor's initial book dump
+    The caller routes events to per-symbol EventClockAggregators (so
+    cancellation/lifespan/arrival features stay symbol-scoped) and seeds
+    each aggregator's OrderBook from snapshots.
+
+    Bitfinex wire-format -> canonical event mapping (HANDOFF.md):
+      book update [ORDER_ID, PRICE, AMOUNT]:
+        PRICE != 0, ORDER_ID new   -> ADD     (side: AMOUNT>0=buy, else=sell)
+        PRICE != 0, ORDER_ID known -> MODIFY  (size: abs(AMOUNT))
+        PRICE == 0                 -> CANCEL  (side from cached ADD; AMOUNT
+                                                sign is also the side marker
+                                                +-1 but we already know it)
+      trade "te" [TRADE_ID, TS_MS, AMOUNT, PRICE] -> TRADE
+        (aggressor_side: AMOUNT>0=buy, else=sell; order_id=0 since
+         Bitfinex doesn't expose maker/taker order_ids on trades)
+      trade "tu"  -> skip (duplicates "te" ~1s later)
+      "hb", info, subscribed, snapshot -> skip in event stream
+        (snapshot orders are NOT emitted as ADD because they were
+         placed before our capture window — their later cancel will
+         have no matching submit_t and the aggregator silently
+         discards it. Acceptable: first ~minute per-file undercount
+         is negligible across the 11-day corpus.)
+
+    Files are read in lexicographic order (which is chronological for
+    YYYYMMDD-suffixed names). The chan_map and per-symbol known_orders
+    sets persist across files so reconnects mid-corpus don't lose
+    state. EOFError on the last file is tolerated (the harvester may
+    have been Stop-Process'd without a clean gzip close).
+
+    Timestamps: book events on Bitfinex don't carry their own ts. We
+    inherit the last-seen trade ts as the event's timestamp. With
+    event-clock aggregation at k=100 events, this approximation is
+    accurate to within milliseconds (since 100 events typically span
+    <1s on a busy symbol).
+    """
+    chan_map: dict[int, tuple[str, str]] = {}
+    # Per-symbol set of currently-resting ORDER_IDs we've observed an ADD for.
+    # Used to distinguish first-time ADD vs MODIFY, and to recognize CANCELs
+    # of pre-existing (snapshot) orders that should be silently dropped.
+    known_orders: dict[str, set[int]] = {}
+    last_ts_ms: int = 0
+
+    for path in sorted(paths):
+        try:
+            with gzip.open(path, "rt", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        msg = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+
+                    # Control / housekeeping messages are dicts with "event".
+                    if isinstance(msg, dict):
+                        if msg.get("event") == "subscribed":
+                            cid = msg.get("chanId")
+                            channel = msg.get("channel")
+                            symbol = msg.get("symbol")
+                            if isinstance(cid, int) and channel and symbol:
+                                chan_map[cid] = (channel, symbol)
+                                known_orders.setdefault(symbol, set())
+                        # info / error / pong / etc. -> ignore
+                        continue
+
+                    if not isinstance(msg, list) or len(msg) < 2:
+                        continue
+
+                    cid = msg[0]
+                    if cid not in chan_map:
+                        # Unknown channel (subscription ack lost or out of order).
+                        continue
+                    channel, symbol = chan_map[cid]
+
+                    if channel == "book":
+                        payload = msg[1]
+                        if payload == "hb":
+                            continue
+                        if not isinstance(payload, list):
+                            continue
+                        # Snapshot: [[oid, price, amount], ...] vs single update [oid, price, amount].
+                        if payload and isinstance(payload[0], list):
+                            # Phase 2: route snapshot to caller so OrderBook
+                            # can be seeded. ALSO track snapshot order_ids in
+                            # our local known_orders set — otherwise CANCELs
+                            # for them get dropped below ("order not in ko"),
+                            # leaving stale orders in the book that crash
+                            # spread/depth features (observed: spread went
+                            # to -156 bps in one BTC test row).
+                            ko_seed = known_orders.setdefault(symbol, set())
+                            for row in payload:
+                                if not isinstance(row, (list, tuple)) or len(row) < 3:
+                                    continue
+                                try:
+                                    seed_oid = int(row[0])
+                                    seed_price = float(row[1])
+                                except (TypeError, ValueError):
+                                    continue
+                                if seed_price > 0:
+                                    ko_seed.add(seed_oid)
+                            yield ("snapshot", symbol, payload)
+                            continue
+                        if len(payload) != 3:
+                            continue
+                        try:
+                            order_id = int(payload[0])
+                            price = float(payload[1])
+                            amount = float(payload[2])
+                        except (TypeError, ValueError):
+                            continue
+
+                        # Hold all book events until the first trade
+                        # establishes a real reference timestamp. Book
+                        # frames don't carry ts; events tagged with ts=0
+                        # would produce nonsensical window durations
+                        # (1.7e12 ms = 1970-to-2026 gap) in the very
+                        # first aggregated tick. Lost events: ~the first
+                        # few seconds of book activity in the very first
+                        # file; subsequent files inherit last_ts_ms.
+                        if last_ts_ms == 0:
+                            continue
+
+                        ko = known_orders.setdefault(symbol, set())
+                        if price == 0.0:
+                            # Cancel (or filled-and-removed; book channel
+                            # doesn't distinguish — that's fine because
+                            # trades come on a different channel).
+                            if order_id not in ko:
+                                # Pre-existing or already-removed order; drop.
+                                continue
+                            ko.discard(order_id)
+                            # AMOUNT sign on cancels is the side marker (+1=bid, -1=ask).
+                            side = "buy" if amount > 0 else "sell"
+                            yield ("event", symbol, OrderEvent(
+                                timestamp_ms=last_ts_ms,
+                                event_type=EventType.CANCEL,
+                                order_id=order_id,
+                                side=side,
+                                price=0.0,
+                                size=0.0,
+                            ))
+                        else:
+                            side = "buy" if amount > 0 else "sell"
+                            size = abs(amount)
+                            if order_id in ko:
+                                yield ("event", symbol, OrderEvent(
+                                    timestamp_ms=last_ts_ms,
+                                    event_type=EventType.MODIFY,
+                                    order_id=order_id,
+                                    side=side,
+                                    price=price,
+                                    size=size,
+                                ))
+                            else:
+                                ko.add(order_id)
+                                yield ("event", symbol, OrderEvent(
+                                    timestamp_ms=last_ts_ms,
+                                    event_type=EventType.ADD,
+                                    order_id=order_id,
+                                    side=side,
+                                    price=price,
+                                    size=size,
+                                ))
+
+                    elif channel == "trades":
+                        payload = msg[1]
+                        if payload == "hb":
+                            continue
+                        # Initial trades snapshot is [[trade...], ...]; skip.
+                        if isinstance(payload, list):
+                            continue
+                        # Single trade: [chanid, "te"|"tu", [trade_id, ts_ms, amount, price]]
+                        if payload not in ("te", "tu") or len(msg) < 3:
+                            continue
+                        if payload == "tu":
+                            # "tu" is a refresh of an earlier "te"; skip to avoid double-count.
+                            continue
+                        trade = msg[2]
+                        if not isinstance(trade, list) or len(trade) < 4:
+                            continue
+                        try:
+                            ts_ms = int(trade[1])
+                            amount = float(trade[2])
+                            price = float(trade[3])
+                        except (TypeError, ValueError):
+                            continue
+                        last_ts_ms = ts_ms
+                        aggressor = "buy" if amount > 0 else "sell"
+                        yield ("event", symbol, OrderEvent(
+                            timestamp_ms=ts_ms,
+                            event_type=EventType.TRADE,
+                            order_id=0,  # Bitfinex doesn't expose maker/taker order_ids on trades
+                            side="",
+                            price=price,
+                            size=abs(amount),
+                            aggressor_side=aggressor,
+                        ))
+        except EOFError:
+            # Last file may be truncated (harvester killed mid-flush). The
+            # decompressor stops cleanly at the last SYNC_FLUSH boundary.
+            print(f"[parse_bitfinex_l3] tolerated EOFError on {path.name}", file=sys.stderr)
+            continue
 
 
 def parse_synthetic_mbo(path: Path) -> Iterator[OrderEvent]:
-    """Parse the canonical OrderEvent CSV format. Useful for testing
+    """Parse our own canonical OrderEvent CSV format. Useful for testing
     aggregation logic before vendor data lands. Schema (CSV columns):
 
         timestamp_ms, event_type, order_id, side, price, size, aggressor_side
@@ -256,60 +397,134 @@ def parse_synthetic_mbo(path: Path) -> Iterator[OrderEvent]:
         )
 
 
-VENDORS = {
+SINGLE_FILE_VENDORS = {
     "databento": parse_databento_mbo,
     "tardis": parse_tardis_mbo,
-    "bitfinex": parse_bitfinex_l3,
     "synthetic": parse_synthetic_mbo,
 }
+MULTI_SYMBOL_VENDORS = {
+    "bitfinex": parse_bitfinex_l3,  # yields (symbol, OrderEvent); fans out to per-symbol CSVs
+}
+ALL_VENDORS = list(SINGLE_FILE_VENDORS) + list(MULTI_SYMBOL_VENDORS)
 
 
 # ============================================================================
 # CLI
 # ============================================================================
 
+def _run_single_file(args: argparse.Namespace) -> None:
+    parser_fn = SINGLE_FILE_VENDORS[args.vendor]
+    if len(args.input_paths) != 1:
+        raise SystemExit(
+            f"--vendor {args.vendor} expects exactly one --in path; "
+            f"got {len(args.input_paths)}"
+        )
+    aggregator = EventClockAggregator(k_events=args.tick_events)
+    args.out.parent.mkdir(parents=True, exist_ok=True)
+    n_ticks = 0
+    with open(args.out, "w", newline="") as f_out:
+        writer = None
+        for event in parser_fn(args.input_paths[0]):
+            tick = aggregator.process(event)
+            if tick is None:
+                continue
+            if writer is None:
+                writer = csv.DictWriter(f_out, fieldnames=list(tick.keys()))
+                writer.writeheader()
+            writer.writerow(tick)
+            n_ticks += 1
+    print(f"Wrote {n_ticks:,} ticks ({args.tick_events} events/tick) to {args.out}")
+
+
+def _run_multi_symbol(args: argparse.Namespace) -> None:
+    parser_fn = MULTI_SYMBOL_VENDORS[args.vendor]
+    if "{symbol}" not in str(args.out):
+        raise SystemExit(
+            f"--vendor {args.vendor} produces per-symbol CSVs; --out must "
+            f"contain a {{symbol}} placeholder (e.g. calibration/l3_ticks_{{symbol}}.csv)"
+        )
+    aggregators: dict[str, EventClockAggregator] = {}
+    out_files: dict[str, "csv.DictWriter"] = {}
+    file_handles: dict[str, object] = {}
+    n_ticks: dict[str, int] = {}
+    n_events: dict[str, int] = {}
+
+    args.out.parent.mkdir(parents=True, exist_ok=True)
+
+    def _ensure_agg(symbol: str) -> None:
+        """Lazy per-symbol initialization: aggregator + output file."""
+        if symbol in aggregators:
+            return
+        aggregators[symbol] = EventClockAggregator(k_events=args.tick_events)
+        out_path = Path(str(args.out).format(symbol=symbol))
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        fh = open(out_path, "w", newline="")
+        file_handles[symbol] = fh
+        out_files[symbol] = None  # type: ignore[assignment]
+        n_ticks[symbol] = 0
+        n_events[symbol] = 0
+        print(f"[{symbol}] opened {out_path}", file=sys.stderr)
+
+    try:
+        for item in parser_fn(args.input_paths):
+            # Phase 2 contract: tagged tuples
+            #   ("event", symbol, OrderEvent)
+            #   ("snapshot", symbol, snapshot_list)
+            kind = item[0]
+            symbol = item[1]
+            _ensure_agg(symbol)
+
+            if kind == "snapshot":
+                aggregators[symbol].seed_book(item[2])
+                continue
+
+            if kind != "event":
+                # Unknown tag — ignore defensively.
+                continue
+
+            event = item[2]
+            n_events[symbol] += 1
+            tick = aggregators[symbol].process(event)
+            if tick is None:
+                continue
+            if out_files[symbol] is None:
+                writer = csv.DictWriter(file_handles[symbol], fieldnames=list(tick.keys()))
+                writer.writeheader()
+                out_files[symbol] = writer
+            out_files[symbol].writerow(tick)
+            n_ticks[symbol] += 1
+    finally:
+        for fh in file_handles.values():
+            fh.close()
+
+    print(f"\nDone. Events per symbol / ticks emitted at k={args.tick_events}:")
+    for sym in sorted(n_ticks):
+        print(f"  {sym:<10}  {n_events[sym]:>12,} events  ->  {n_ticks[sym]:>9,} ticks")
+
+
 def main() -> None:
     p = argparse.ArgumentParser(
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    p.add_argument("--vendor", choices=list(VENDORS.keys()), required=True,
-                   help="MBO source format. 'synthetic' uses the canonical CSV; "
-                        "'bitfinex' parses harvest_bitfinex_l3.py output; "
-                        "'databento'/'tardis' require data acquisition first.")
-    p.add_argument("--in", dest="input_path", type=Path, required=True,
-                   help="Path to raw MBO file.")
+    p.add_argument("--vendor", choices=ALL_VENDORS, required=True,
+                   help="MBO source format. 'bitfinex' takes multiple gz files "
+                        "and fans out per-symbol CSVs.")
+    p.add_argument("--in", dest="input_paths", type=Path, nargs="+", required=True,
+                   help="Path(s) to raw MBO file(s). Single path for "
+                        "synthetic/databento/tardis; one or more for bitfinex.")
     p.add_argument("--out", type=Path, required=True,
-                   help="Path to write aggregated event-clock tick CSV.")
+                   help="Output CSV path. For bitfinex, must contain {symbol} "
+                        "placeholder (e.g. calibration/l3_ticks_{symbol}.csv).")
     p.add_argument("--tick-events", type=int, default=100,
                    help="Events per tick (event-clock K). Default 100; the "
                         "L3_RESEARCH_PLAN §7 initial choice.")
     args = p.parse_args()
 
-    parser_fn = VENDORS[args.vendor]
-    aggregator = EventClockAggregator(k_events=args.tick_events)
-
-    args.out.parent.mkdir(parents=True, exist_ok=True)
-    n_ticks = 0
-    fieldnames = None
-
-    with open(args.out, "w", newline="") as f_out:
-        writer = None
-        for event in parser_fn(args.input_path):
-            tick = aggregator.process(event)
-            if tick is None:
-                continue
-            if writer is None:
-                fieldnames = list(tick.keys())
-                writer = csv.DictWriter(f_out, fieldnames=fieldnames)
-                writer.writeheader()
-            writer.writerow(tick)
-            n_ticks += 1
-
-    print(
-        f"Wrote {n_ticks:,} event-clock ticks "
-        f"({args.tick_events} events/tick) to {args.out}"
-    )
+    if args.vendor in MULTI_SYMBOL_VENDORS:
+        _run_multi_symbol(args)
+    else:
+        _run_single_file(args)
 
 
 if __name__ == "__main__":

@@ -700,6 +700,303 @@ The dominant constraint on HL is positive-label *count*, not density and
 not feature concentration. Combined fixes (multi-coin + liquidation
 channel + 14-21 day harvest) target this directly.
 
+## 15. L3 chapter — Bitfinex pivot, sensor stack, per-symbol breakthrough (2026-05-12 → 2026-05-24)
+
+### 15.1 Data acquisition — Coinbase closed, Bitfinex opened (2026-05-12)
+
+§14.8 set Pivot 3 (L3 microstructure) as the next direction. First task
+was finding a free L3 venue.
+
+- Coinbase Exchange `full` channel went behind HMAC auth (`level2, level3,
+  and full channels now require authentication`). HMAC signing was
+  implemented and tested cleanly against the protocol, but
+  exchange.coinbase.com retail signup is gated — `mihirpabby@gmail.com
+  does not have access to Coinbase Exchange. If you are not applying
+  on behalf of a business`. Business API access priced at ~$5k. Closed.
+- Tardis paid-only (confirmed earlier at §14.8's data discussion).
+- Databento crypto-spot gated.
+- Kraken `book-l3` deprecated.
+- **Bitfinex public WS `book` channel with `prec=R0`**: still free, no
+  auth, emits per-`ORDER_ID` adds / modifies / cancels.
+  `trades` channel gives executed trades with aggressor side via AMOUNT
+  sign. Single known free venue for true L3.
+
+Built `harvest_bitfinex_l3.py` (gzipped JSONL, UTC rotation, periodic
+5s flush so a crash loses at most ~5s, exponential-backoff reconnect),
+captured **11 calendar days** (2026-05-12 → 2026-05-23) for tBTCUSD /
+tETHUSD / tSOLUSD: **61.9M events total, ~360 MB compressed**.
+
+### 15.2 Phase 1.5 — basic 11-feature aggregator (2026-05-23)
+
+Built the L3_RESEARCH_PLAN §4.3 scaffolding aggregator:
+`aggregate_mbo_events.py` with an `EventClockAggregator` that emits one
+row per K=100 events with 11 flow-only features (arrival/cancel rates
+per side, mean lifespans, aggressor imbalance, cancel/fill ratios,
+event density, window duration).
+
+Trained a `TCNSpikePredictor` (31k params, in_channels=11) on
+directional H-tick targets — same protocol as §14.4 so results stay
+comparable. Sweep over H ∈ {100, 300, 500, 1000}, pushed config
+H=300 with 20 epochs + seq_len 200 was the best.
+
+**Phase 1.5 result.** Best lift 1.64× at thr=0.70 on N=120 (H=300
+pushed). Per-symbol PnL (q=1.0 ceiling fills, default fees
+1bp maker / 10bps taker — see §15.7 for fee model correction):
+- ETH +7.36 bps/trade at H=300 thr=0.65 (✓ above §6 success bar)
+- SOL +1.60 bps/trade at H=300 thr=0.65 (marginal)
+- **BTC -3 to -10 bps/trade at every config** (✗ — the failure mode)
+- Pool net negative (BTC drag dominates dollar-wise)
+
+Diagnosis: the 11-feature aggregation throws away book-state context.
+L3_RESEARCH_PLAN §4.2 specifies 7 sensors, only 4 had basic forms in
+this aggregator. The three missing (`OrderBookReconstructor`,
+`HiddenOrderDetector`, `QueueDepletionTracker`) and two underdeveloped
+(`OrderLifespanTracker` mean-only vs percentile distributions;
+`AggressorSequenceTracker` imbalance-only vs autocorrelation) — exactly
+the book-state-conditional features that should help on the highest-
+liquidity symbol (BTC).
+
+### 15.3 Phase 2 — full sensor stack, pooled training (2026-05-24)
+
+Built `layer1_l3_sensors.py` mirroring the L2 `layer1_sensors.py`
+pattern: per-tracker class with `process(event)` + property getters
++ `reset()`, plus an `L3SensorArray` orchestrator. Final feature set
+is 19 channels (kept 6 from Phase 1.5; dropped 5 noisy ones; added
+13 new from book/queue/hidden/percentile/autocorr sensors).
+
+**Three implementation details that decided whether features were
+sane or garbage:**
+
+1. **Book reset on every snapshot.** Bitfinex emits a snapshot at
+   every (re)connect — the venue's authoritative current state.
+   Without `self.book.reset()` before re-seeding, snapshot-seeded
+   orders accumulated alongside stale orders from prior sessions,
+   causing crossed best_bid/best_ask in 99%+ of ticks.
+
+2. **Stale-order pruning around `last_trade_price`.** Bitfinex's
+   `book(R0, len=25)` only sends deletes for orders inside the
+   top-25 visible window. Orders that fall *out* of view (price
+   moves away) never get a delete and persist in our book forever.
+   `OrderBook.prune_far_from(last_trade, max_pct=0.01)` called after
+   every event evicts those stragglers. **This single fix dropped
+   negative-spread tick rate from 99% to 0.2-2%** (median spread
+   1.9-3.1 bps, realistic Bitfinex).
+
+3. **CANCEL enrichment from book before sensor dispatch.** Bitfinex
+   CANCEL frames carry `price=0, amount=±1` (side marker only), no
+   size. `L3SensorArray.process()` looks up the order's real
+   `(price, size)` from the OrderBook *before* dispatching the
+   enriched event to sensors, so `QueueDepletionTracker` can
+   correctly check whether the cancel was at top-of-book and weight
+   by the cancelled order's actual size.
+
+Also rebuilt `HiddenOrderDetector` from the original 200ms
+recent-ADD window approach (which falsely flagged 98% of trades
+as hidden) to a book-based check (trade looks for matching resting
+order in current book; missing → hidden). Hidden rate became 8-17%
+across symbols, realistic.
+
+28 unit tests in `tests/test_layer1_l3_sensors.py` covering snapshot
+seeding, ADD/CANCEL/MODIFY roundtrips, percentile output, autocorr
+sign, book-cap eviction, integration via L3SensorArray.
+
+**Phase 2 pooled training (3 symbols pooled, pushed H sweep):**
+
+| H | Loss | Pool best lift | At N | Pool net bps @ thr=0.85 |
+|---|---|---|---|---|
+| 100 | 0.6685 | 1.169× | 267 | -0.83 |
+| 300 | 0.6705 | 1.471× | 1161 | +0.73 |
+| 500 | 0.6621 | 1.337× | 1056 | +1.21 |
+| 1000 | 0.6684 | **1.811×** | 241 | **+1.33** |
+
+vs Phase 1.5 pushed (H=300): loss 0.6900, lift 1.64×, pool -1.41 bps.
+Loss converged meaningfully better (0.66-0.67 vs Phase 1.5's stuck
+~0.69); pool went net-positive at high thresholds for every H ≥ 300.
+
+**Per-symbol breakdown at the pool best (H=500 thr=0.85):**
+- BTC: 405 trades, 57.3% win, **+3.69 bps/trade** ← previously -7 bps
+- ETH: 777 trades, 43.9% win, -13.35 bps ← previously -4.48 bps
+- SOL: 1710 trades, 40.6% win, -4.80 bps ← previously -4.31 bps
+
+**The pool-positive result is BTC-concentrated.** Phase 1.5's BTC drag
+was the design target, and the new sensors fix it. But ETH and SOL got
+*worse* under the pooled fit — the model optimized for BTC's book-state
+signal at the cost of the other two.
+
+### 15.4 Per-symbol training — the breakthrough (2026-05-24)
+
+Trained 9 separate models (3 coins × H=300/500/1000), each on its
+symbol's data only. Hypothesis: pooled training was averaging
+incompatible signals; per-coin models should fit each coin's
+microstructure independently.
+
+Confirmed. Every per-symbol model converged to lower loss than the
+pooled equivalent (best 0.6263 SOL H=500 vs pooled best 0.6621), and
+all three coins go net-positive at their own optimal horizon × threshold:
+
+| Symbol | Best H | Best thr | Net bps/trade | Win rate | N trades | L/S split |
+|---|---|---|---|---|---|---|
+| BTC | 1000 | 0.90 | **+11.96** | 53.2% | 235 | 216/19 |
+| ETH | 500 | 0.90 | **+4.97** | 68.5% | 820 | 547/273 |
+| SOL | 300 | 0.90 | **+26.34** | 66.0% | 853 | 380/473 |
+
+(Headline numbers above use the backtest's low-fee defaults; see §15.7
+for fee correction at standard retail and the val-window concentration
+finding.)
+
+Comparison vs Phase 2 pooled (same H=1000 thr=0.85):
+
+| Symbol | Pooled | Per-symbol best | Delta |
+|---|---|---|---|
+| BTC | +5.30 bps | +11.96 bps | **2.3× better** |
+| ETH | -11.84 bps | +4.97 bps | **sign-flipped** |
+| SOL | -93.48 bps | +26.34 bps | **catastrophically negative → strongly positive** |
+
+Three signals this is real, not trend-capture:
+1. Each coin's best horizon differs (BTC=1000, ETH=500, SOL=300).
+   A pure-trend strategy would converge on one horizon.
+2. L/S bias differs by coin — BTC long-biased, SOL short-biased.
+   A bull (or bear) val window would make all three lean the same way.
+3. Win rates 53-69% (sensible, not the suspicious 99% from the
+   training-time precision metric which inflated at sparse-N
+   thresholds).
+
+### 15.5 Sanity check — BTC counter-trend wins (2026-05-24)
+
+Reasonable concern: BTC H=1000 thr=0.90 was 216 long / 19 short.
+If the val window was bullish, the long bias could be trend-capture.
+
+Investigated. The BTC val window (last 20% of 11-day capture,
+2026-05-21 14:00Z → 2026-05-23 16:58Z, 51h):
+- **Price: $77,137 → $75,520 (-2.10%)** — bearish
+- Range: $74,094 - $78,137
+
+The model went long-biased in a falling market and still won 215/216
+long trades (99.5% precision). That is the *opposite* of trend-following.
+The model is finding local upward bounces within the downtrend.
+
+Bootstrap test: drew 1000 random samples of 216 long entries from the
+same val window. Random long-only entries averaged -4.26 bps/trade
+(matching the -2.10% bearish trend). Model averaged **+29.96 bps gross
+per long trade — 100th percentile** of the bootstrap distribution (no
+random sample beat it). Edge over random = +34.21 bps.
+
+Asymmetry observation: the model is excellent on UP signals in this
+regime but terrible on DOWN — 15.8% precision on the 19 short signals.
+The L3 signature it learned is **regime-conditioned**: detects local
+UP-mean-reversions within down moves, but no good signature for
+genuine downside continuation in this val window.
+
+### 15.6 Status, caveats, next steps (initial Phase 2 framing — see §15.7 for corrections)
+
+**Status.** The L3 thesis is the first thing in this entire investigation
+that produces simultaneous positive net per-trade edge on all three
+captured symbols. The per-symbol approach + Phase 2 sensor stack
+together cleared every Phase 2 pass criterion from L3_RESEARCH_PLAN §6:
+- F2 / max-prec lift ≥ 1.5× (BTC H=300 1.601×, SOL H=300 1.624×,
+  BTC H=1000 2.14×)
+- Gross edge ≥ 2 bps/trade (BTC H=1000 thr=0.90 gross +23 bps)
+- BTC into positive (was -7 bps pooled, now +12 bps per-symbol)
+
+**Caveats worth restating before any "ship it" thought:**
+- All "best" configs sit at thr=0.90 — extremely selective. Medium-
+  confidence predictions still net-negative. The strategy is "wait for
+  the rare high-confidence signal" not "trade continuously."
+- N=235-853 per symbol over an 11-day val window. Statistical edges
+  with this sample have wide confidence intervals.
+- Single val regime. The BTC sanity check showed strong counter-trend
+  performance in a -2.1% window, but generalization across bull /
+  sideways / volatile-chop regimes is not verified.
+- The 99.5% BTC long-precision is statistically extreme. Bootstrap
+  rules out random luck, but doesn't rule out the model having
+  overfit to specific bounce patterns in this single val window.
+- Long/short asymmetry suggests the model has half a signal, not a
+  symmetric one. UP-detection on BTC is strong; DOWN-detection is bad.
+
+These initial caveats were the right list at the time. §15.7 (added
+in the same day's follow-up session) substantially expands the
+caveat list — the headline numbers above were generated under a fee
+assumption that doesn't match standard retail, and the val window
+turns out to be effectively a single fire-day. Read §15.7 before
+quoting any of the §15.4 / §15.6 numbers.
+
+### 15.7 Phase 2 follow-up — fee correction, ablation, val-window concentration (2026-05-24)
+
+§15.1-§15.6 documents the Phase 2 implementation and the headline
+"thesis confirmed" result. This subsection captures the follow-up
+analysis run the same day, which **substantially reframes** the
+strength of that result without falsifying the underlying signal.
+
+**Fee mislabel correction.** `backtest_l3_directional.py` defaulted to
+1 bp maker / 10 bps taker = 11 bps round-trip, labeled as "Bitfinex
+retail." Standard public retail Bitfinex crypto is 10 bps maker /
+20 bps taker = **30 bps RT** — 19 bps higher per trade. Re-running
+Phase 2 at standard retail collapses BTC (+12.0 → −7.0 bps) and ETH
+(+5.0 → −14.0 bps) at thr=0.90; only SOL clearly survives (+22.75 →
++7.34 bps at thr=0.90). Extended threshold sweep: BTC crosses positive
+at thr=0.98 (+0.06 bps); ETH never crosses; SOL peaks at thr=0.98
+(+22.75 bps, N=118).
+
+**Inference-time channel ablation on SOL** (19 single-channel zeroings
+plus a 10-channel multi-zero). Rank-reliable result: lifespan_p50 (bid
+and ask), hidden_trade_rate, and event_density_per_s are the strongest
+single-channel contributors. p95 lifespan features rank as "harmful"
+when zeroed individually — but the 10-channel multi-zero collapsed
+the model entirely (−29.58 at thr=0.95), confirming inference-time
+ablation produces a valid ranking but not a recipe for removal. True
+ablation requires retraining.
+
+**Val-window concentration finding.** With train_frac=0.8, the SOL
+val window is 2.12 days (2026-05-21 14:07 → 2026-05-23 16:58), not
+the "11 days" implied by the capture span. **All 423 SOL trades at
+thr=0.95 fire on a single calendar day (2026-05-23).** The val spans
+3 calendar dates; on May 21-22, model predictions never cross
+threshold (pred_max on May 22 = 0.945, on May 21 = 0.900). Every
+Phase 2 SOL statistic — the +11.97 bps mean, the 100th-percentile
+random-entry comparison, the bootstrap CI [+7.40, +16.51] — is
+*single-fire-day* evidence.
+
+**Train fire-rate diagnostic** disambiguates the failure mode.
+Running the same per-day analysis on the train split: model fires on
+**9 of 10 training days**, with fire rates ranging 0.01% to 7.30%.
+The model is structurally a *rare-firer* with fluent firing across
+regimes, not a pathological one-day overfit. The single-day val
+pattern is consistent with "val happened to contain 2 non-fire days
++ 1 fire day," not "model collapsed to one regime."
+
+**Threshold sweep confirms threshold is doing real noise filtering.**
+Forcing May 21-22 to fire by lowering threshold:
+
+| thr  | May 21       | May 22       |
+|------|-------------:|-------------:|
+| 0.90 | N=17, −12.34 | N=12, −22.47 |
+| 0.93 | N=3,  −5.60  | N=1,  −7.06  |
+| 0.95 | no fire      | no fire      |
+
+The "near-miss" predictions on May 21-22 are genuinely noise, not
+"almost-signal." Threshold ~0.95 is correctly tuned.
+
+**Refined Phase 2 framing.** SOL is a **calibrated rare-firer-but-real
+candidate**, not a "breakthrough" signal. Per-fire-day economics are
+known for exactly one fire-day (May 23, +11.97 bps at thr=0.95).
+Whether this generalizes — whether the per-fire-day distribution
+across multiple fire-days is positive on average — is the open
+question and the only thing window-2 data can resolve.
+
+The §15.6 "thesis confirmed" language overstates the evidence.
+Replacement framing: **Phase 2 produced a calibrated rare-firer
+candidate with single-fire-day evidence; window-2 generalization is
+the gating experiment**, not "additional confirmation."
+
+**Artifacts** (paths relative to `research/path_h_l3/`):
+- [analysis/analysis_sol_fulltest.py](../research/path_h_l3/analysis/analysis_sol_fulltest.py) — per-trade dump, bootstrap CI, drawdown, payoff distribution, per-day + time-of-day breakdown
+- [analysis/analysis_sol_firerate_per_day.py](../research/path_h_l3/analysis/analysis_sol_firerate_per_day.py) — per-day fire-rate + prediction quantiles on train AND val
+- [analysis/analysis_sol_threshold_sweep.py](../research/path_h_l3/analysis/analysis_sol_threshold_sweep.py) — threshold sweep with per-day breakdown
+- `calibration/fulltest_sol_summary.json`, `_firerate_per_day.json`, `_threshold_sweep.json` — output artifacts
+- `calibration/ablation_sol_summary.json` — single-channel ablation ranking
+- [NEXT_PHASE_PLAN.md](../research/path_h_l3/NEXT_PHASE_PLAN.md) — refined success criteria, three w2 scenarios, Layer 3/4 progression, deployment plan
+- [HANDOFF.md](../research/path_h_l3/HANDOFF.md) §"Post-Phase-2 follow-up analysis" — same content as this subsection in operational form
+
 ## 14. Pivot to directional bias prediction — L2 features carry real alpha (2026-05-12)
 
 ### 14.1 Temporal integrity check — §13.4 baseline was modestly inflated

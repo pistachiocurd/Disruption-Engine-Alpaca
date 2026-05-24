@@ -287,6 +287,31 @@ data layer. Documented as `docs/LAYER3_TRAINING.md` §15 NEGATIVE.
 If either threshold clears, Phase 6 is justified and the architecture
 pivot pays off.
 
+### 6.1 Refined success criteria (added 2026-05-24, after Phase 2 follow-up)
+
+§6 was set before we understood the val-window concentration risk
+and before fee assumptions were nailed down. Phase 2 met every §6
+criterion *and still produced a single-fire-day candidate signal*.
+Refined criteria for "go live / proceed to Layer 3":
+
+| Criterion | Original §6 | Refined |
+|---|---|---|
+| Lift over baseline | ≥ 1.5× | unchanged |
+| Gross edge | ≥ 2 bps/trade | unchanged |
+| **Net after standard retail fees (30 bps RT)** | not measured | ≥ 5 bps/trade on at least 60% of fire-days |
+| **Multi-fire-day generalization** | not measured | net positive on ≥ 4 of w2's fire-days, with 95% CI on pooled mean > 0 |
+| **Per-fire-day variance** | not measured | std/mean ≤ 1.5 across w2 fire-days |
+| **Per-fire-day N** | not measured | ≥ 30 trades per fire-day |
+
+The "single val window passes §6" pattern is a known failure mode:
+in-sample concentration can produce headline-positive metrics that
+collapse on out-of-time data. Multi-fire-day generalization across
+≥ 2 independent capture windows is the load-bearing addition.
+
+See [NEXT_PHASE_PLAN.md](NEXT_PHASE_PLAN.md) for the full plan
+including three scenarios for w2 outcome and what each unlocks for
+Layer 3 / Layer 4 work.
+
 ## 7. Kickoff decisions (resolved 2026-05-12)
 
 | # | Decision | Choice | Rationale |
