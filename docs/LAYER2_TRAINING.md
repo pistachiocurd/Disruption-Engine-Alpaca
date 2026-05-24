@@ -920,6 +920,83 @@ assumption that doesn't match standard retail, and the val window
 turns out to be effectively a single fire-day. Read §15.7 before
 quoting any of the §15.4 / §15.6 numbers.
 
+### 15.7 Phase 2 follow-up — fee correction, ablation, val-window concentration (2026-05-24)
+
+§15.1-§15.6 documents the Phase 2 implementation and the headline
+"thesis confirmed" result. This subsection captures the follow-up
+analysis run the same day, which **substantially reframes** the
+strength of that result without falsifying the underlying signal.
+
+**Fee mislabel correction.** `backtest_l3_directional.py` defaulted to
+1 bp maker / 10 bps taker = 11 bps round-trip, labeled as "Bitfinex
+retail." Standard public retail Bitfinex crypto is 10 bps maker /
+20 bps taker = **30 bps RT** — 19 bps higher per trade. Re-running
+Phase 2 at standard retail collapses BTC (+12.0 → −7.0 bps) and ETH
+(+5.0 → −14.0 bps) at thr=0.90; only SOL clearly survives (+22.75 →
++7.34 bps at thr=0.90). Extended threshold sweep: BTC crosses positive
+at thr=0.98 (+0.06 bps); ETH never crosses; SOL peaks at thr=0.98
+(+22.75 bps, N=118).
+
+**Inference-time channel ablation on SOL** (19 single-channel zeroings
+plus a 10-channel multi-zero). Rank-reliable result: lifespan_p50 (bid
+and ask), hidden_trade_rate, and event_density_per_s are the strongest
+single-channel contributors. p95 lifespan features rank as "harmful"
+when zeroed individually — but the 10-channel multi-zero collapsed
+the model entirely (−29.58 at thr=0.95), confirming inference-time
+ablation produces a valid ranking but not a recipe for removal. True
+ablation requires retraining.
+
+**Val-window concentration finding.** With train_frac=0.8, the SOL
+val window is 2.12 days (2026-05-21 14:07 → 2026-05-23 16:58), not
+the "11 days" implied by the capture span. **All 423 SOL trades at
+thr=0.95 fire on a single calendar day (2026-05-23).** The val spans
+3 calendar dates; on May 21-22, model predictions never cross
+threshold (pred_max on May 22 = 0.945, on May 21 = 0.900). Every
+Phase 2 SOL statistic — the +11.97 bps mean, the 100th-percentile
+random-entry comparison, the bootstrap CI [+7.40, +16.51] — is
+*single-fire-day* evidence.
+
+**Train fire-rate diagnostic** disambiguates the failure mode.
+Running the same per-day analysis on the train split: model fires on
+**9 of 10 training days**, with fire rates ranging 0.01% to 7.30%.
+The model is structurally a *rare-firer* with fluent firing across
+regimes, not a pathological one-day overfit. The single-day val
+pattern is consistent with "val happened to contain 2 non-fire days
++ 1 fire day," not "model collapsed to one regime."
+
+**Threshold sweep confirms threshold is doing real noise filtering.**
+Forcing May 21-22 to fire by lowering threshold:
+
+| thr  | May 21       | May 22       |
+|------|-------------:|-------------:|
+| 0.90 | N=17, −12.34 | N=12, −22.47 |
+| 0.93 | N=3,  −5.60  | N=1,  −7.06  |
+| 0.95 | no fire      | no fire      |
+
+The "near-miss" predictions on May 21-22 are genuinely noise, not
+"almost-signal." Threshold ~0.95 is correctly tuned.
+
+**Refined Phase 2 framing.** SOL is a **calibrated rare-firer-but-real
+candidate**, not a "breakthrough" signal. Per-fire-day economics are
+known for exactly one fire-day (May 23, +11.97 bps at thr=0.95).
+Whether this generalizes — whether the per-fire-day distribution
+across multiple fire-days is positive on average — is the open
+question and the only thing window-2 data can resolve.
+
+The §15.6 "thesis confirmed" language overstates the evidence.
+Replacement framing: **Phase 2 produced a calibrated rare-firer
+candidate with single-fire-day evidence; window-2 generalization is
+the gating experiment**, not "additional confirmation."
+
+**Artifacts** (paths relative to `research/path_h_l3/`):
+- [analysis/analysis_sol_fulltest.py](../research/path_h_l3/analysis/analysis_sol_fulltest.py) — per-trade dump, bootstrap CI, drawdown, payoff distribution, per-day + time-of-day breakdown
+- [analysis/analysis_sol_firerate_per_day.py](../research/path_h_l3/analysis/analysis_sol_firerate_per_day.py) — per-day fire-rate + prediction quantiles on train AND val
+- [analysis/analysis_sol_threshold_sweep.py](../research/path_h_l3/analysis/analysis_sol_threshold_sweep.py) — threshold sweep with per-day breakdown
+- `calibration/fulltest_sol_summary.json`, `_firerate_per_day.json`, `_threshold_sweep.json` — output artifacts
+- `calibration/ablation_sol_summary.json` — single-channel ablation ranking
+- [NEXT_PHASE_PLAN.md](../research/path_h_l3/NEXT_PHASE_PLAN.md) — refined success criteria, three w2 scenarios, Layer 3/4 progression, deployment plan
+- [HANDOFF.md](../research/path_h_l3/HANDOFF.md) §"Post-Phase-2 follow-up analysis" — same content as this subsection in operational form
+
 ## 14. Pivot to directional bias prediction — L2 features carry real alpha (2026-05-12)
 
 ### 14.1 Temporal integrity check — §13.4 baseline was modestly inflated

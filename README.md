@@ -1,22 +1,32 @@
 # Disruption Arbitrage Engine
 
-> **Status (2026-05-12)**: Private research prototype. **L2 investigation
-> formally closed** — the Path D feature set (CE ratio, OBI, MLOFI, VAMP,
-> Kyle's λ) carries real directional signal (~55% paper accuracy at H=100
-> ticks) but at magnitudes too small to overcome maker+taker execution
-> costs: gross edge ≈ 0.06 bps per trade vs round-trip cost ≈ 5.5 bps.
-> Full Phase A backtest in [LAYER2_TRAINING.md §14.7-§14.8](docs/LAYER2_TRAINING.md).
-> **Next research generation pivots to L3 (order-by-order) microstructure
-> data** — queue depletion, cancellation velocity, order lifespan — which
-> L2 snapshots aggregate away. Codebase preserved as the L2 reference
-> baseline (anything L3 builds must beat F2=0.106 in-domain / max-prec
-> 1.5× base / 0.06 bps gross directional edge). **Not production-ready** —
-> `_live_submit` is a stub by design; the engine runs in shadow mode
-> against simulated fills.
+> **Status (2026-05-24)**: Private research prototype.
+>
+> **L3 microstructure investigation in progress.** Phase 2 sensor stack +
+> per-symbol TCN training (see [docs/LAYER2_TRAINING.md §15](docs/LAYER2_TRAINING.md))
+> produced a **calibrated rare-firer candidate** on SOL: +11.97 bps/trade
+> at thr=0.95 over 423 trades — but all 423 trades fired on a single
+> calendar day. Threshold sweep + train-set fire-rate diagnostic confirm
+> the model is structurally a rare-firer (fires on 9/10 training days)
+> with correctly tuned threshold (forcing non-fire days to fire produces
+> losses). Window-2 harvest is in progress; multi-fire-day generalization
+> is the gating experiment before any Layer 3 (execution policy) or
+> live-deployment work. See
+> [research/path_h_l3/HANDOFF.md](research/path_h_l3/HANDOFF.md) and
+> [research/path_h_l3/NEXT_PHASE_PLAN.md](research/path_h_l3/NEXT_PHASE_PLAN.md).
+>
+> **L2 investigation closed** (§14.7-§14.8). Path D features (CE ratio,
+> OBI, MLOFI, VAMP, Kyle's λ) carry real directional signal (~55% paper
+> accuracy at H=100 ticks) but at gross edge ≈ 0.06 bps/trade vs round-trip
+> cost ≈ 5.5 bps — too small to overcome execution costs. The L3 pivot
+> rationale: L2 snapshots aggregate away the dynamics that PRECEDE
+> book-state changes (queue depletion, cancellation velocity, order
+> lifespan).
+>
+> **Not production-ready** — `_live_submit` is a stub by design; the
+> engine runs in shadow mode against simulated fills.
 
 ![Engine running in shadow mode against TSLA replay](docs/screenshots/dashboard_running.png)
-
-(NONE OF THIS IS TRUE ANYMORE UPDATE - READ OTHER DOCS FOR MORE UP TO DATE INFORMATION REGARDING MAJOR ARCHITECTURAL CHANGES)
 
 Physics-informed market microstructure research engine. Originally built
 as a shock-arbitrage system: detect pre-shock signatures via L2-aggregate

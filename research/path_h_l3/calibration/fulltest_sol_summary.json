@@ -1,0 +1,119 @@
+{
+  "config": "tSOLUSD H=300 thr=0.95 fees=10/20bps q=1.0 train_frac=0.8",
+  "baseline": {
+    "n": 423,
+    "mean_bps": 11.969084143037847,
+    "win_pct": 55.319148936170215,
+    "long": 170,
+    "short": 253
+  },
+  "per_day_utc": [
+    {
+      "date": "2026-05-21",
+      "val_ticks": 9435,
+      "trades": 0,
+      "fire_rate_pct": 0.0,
+      "mean_bps": 0.0,
+      "win_pct": 0.0
+    },
+    {
+      "date": "2026-05-22",
+      "val_ticks": 18392,
+      "trades": 0,
+      "fire_rate_pct": 0.0,
+      "mean_bps": 0.0,
+      "win_pct": 0.0
+    },
+    {
+      "date": "2026-05-23",
+      "val_ticks": 9825,
+      "trades": 423,
+      "fire_rate_pct": 4.305343511450381,
+      "mean_bps": 11.969084143037847,
+      "win_pct": 55.319148936170215
+    }
+  ],
+  "per_hour_utc": [
+    {
+      "hour_utc": 2,
+      "n": 40,
+      "mean_bps": -60.581982604792884,
+      "win_pct": 0.0
+    },
+    {
+      "hour_utc": 4,
+      "n": 50,
+      "mean_bps": 0.03889392413987697,
+      "win_pct": 60.0
+    },
+    {
+      "hour_utc": 6,
+      "n": 56,
+      "mean_bps": -9.453970782885355,
+      "win_pct": 5.357142857142857
+    },
+    {
+      "hour_utc": 7,
+      "n": 89,
+      "mean_bps": 82.86072699155407,
+      "win_pct": 93.25842696629213
+    },
+    {
+      "hour_utc": 9,
+      "n": 26,
+      "mean_bps": -54.53716987681788,
+      "win_pct": 0.0
+    },
+    {
+      "hour_utc": 10,
+      "n": 39,
+      "mean_bps": -28.817641799970463,
+      "win_pct": 0.0
+    },
+    {
+      "hour_utc": 11,
+      "n": 21,
+      "mean_bps": 0.9480679432073076,
+      "win_pct": 76.19047619047619
+    },
+    {
+      "hour_utc": 12,
+      "n": 102,
+      "mean_bps": 30.990391002664293,
+      "win_pct": 100.0
+    }
+  ],
+  "random_bootstrap": {
+    "n_samples": 1000,
+    "random_mean_bps": -29.71379486711269,
+    "random_p5_bps": -32.65316360764633,
+    "random_p95_bps": -26.661923580425594,
+    "random_p99_bps": -25.717890153937102,
+    "model_percentile_of_random": 100.0,
+    "edge_over_random_bps": 41.682879010150536
+  },
+  "self_bootstrap_ci": {
+    "ci_95_low": 7.403727197915044,
+    "ci_95_high": 16.50683022946329,
+    "ci_p5_one_sided": 7.908139964073794,
+    "crosses_zero": false
+  },
+  "trade_distribution": {
+    "min_bps": -67.0284915546842,
+    "p5": -60.21814061584627,
+    "median": 1.5944449409953374,
+    "p95": 97.2711287838784,
+    "max_bps": 134.14762118995188,
+    "n_winners": 234,
+    "mean_win_bps": 46.299708351133475,
+    "n_losers": 189,
+    "mean_loss_bps": -30.53549820984246,
+    "payoff_ratio": 1.5162584881686902
+  },
+  "drawdown": {
+    "max_dd_bps": 2927.6359051450977,
+    "final_cum_bps": 5062.92259250501,
+    "peak_cum_bps": 5062.92259250501,
+    "longest_losing_streak": 72
+  }
+}
