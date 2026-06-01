@@ -1,13 +1,19 @@
 # Next Phase Plan — Post-Phase-2 Follow-up + Layer Progression
 
-> Created 2026-05-24 after Phase 2 follow-up analysis. Successor to
-> HANDOFF.md "Outstanding (in priority order)" — captures the refined
-> picture of the SOL signal candidate, the gating role of window-2
-> harvest, and the path through Layer 3 (execution policy) + Layer 4
-> (shadow validation) into live deployment.
+> Created 2026-05-24 after Phase 2 follow-up analysis.
 >
-> Read this AFTER [HANDOFF.md](HANDOFF.md). HANDOFF is the
-> point-in-time state; this is the forward plan.
+> **UPDATE 2026-06-01**: Window-2 forward-test resolved §3 in the
+> **Scenario A (regime overfit)** case. Phase 2 thesis falsified on
+> out-of-sample data. Feature drift diagnostic identified the failure
+> mechanism. §1-§9 below are preserved as historical context — the
+> active forward plan is now **§11 (Phase 3: drift-robust feature
+> engineering)** at the bottom of this document.
+>
+> Read in this order:
+> 1. [HANDOFF.md](HANDOFF.md) — current operational state
+> 2. §11 below — the actual forward plan
+> 3. §1-§9 — historical context (most still relevant; Scenario A
+>    "next actions" at §3 are now what's being executed)
 
 ## 1. Where we are (2026-05-24)
 
@@ -441,3 +447,193 @@ not repeat:
    scenario A, don't try to "fix" the SOL model with ever-more-clever
    ablations or threshold tunings — reset the L2 architecture or
    pivot instruments.
+
+---
+
+## 11. Phase 3 — Drift-robust feature engineering (added 2026-06-01)
+
+> Phase 2 was falsified on w2: Scenario A confirmed. The failure
+> mechanism is documented (feature distribution drift on the top
+> load-bearing channels). This section is the new active forward
+> plan. The pre-2026-06-01 sections above (§1-§10) are historical
+> context for why we're here.
+
+### 11.1 What's being changed and why
+
+The diagnostic (`analysis/analysis_sol_w2_feature_drift.py`) shows that
+the three most load-bearing channels (per the prior ablation) are also
+the three biggest drifters between w1 and w2:
+
+| Channel | Ablation load | KS-D | Drift mode |
+|---|---:|---:|---|
+| `hidden_trade_rate` | +29.19 bps | **0.239** | −0.52σ mean shift + 38% variance compression |
+| `lifespan_bid_p50_ms` | +34.49 bps | **0.137** | +0.37σ mean shift + 16% variance expansion |
+| `lifespan_ask_p50_ms` | +49.96 bps | **0.125** | +0.41σ mean shift + 29% variance expansion |
+
+These are *raw values* that depend on the current mix of market
+participants. Participant mix is week-to-week non-stationary. Any
+model that uses these as raw inputs with static normalization will
+fail across capture windows.
+
+The fix is **scale-invariant feature engineering**: replace raw values
+with features that are robust to distribution shift by construction.
+This addresses the root cause; rolling-window normalization would only
+patch the symptom.
+
+### 11.2 Candidate feature designs
+
+For each problematic channel, three drift-robust alternatives to test:
+
+**A. Percentile rank within rolling window.** Replace raw value with
+its percentile rank against a recent window. E.g., `hidden_trade_rate`
+becomes "what fraction of the last 6 hours of ticks had
+hidden_trade_rate ≤ this tick's value?" Output ∈ [0, 1], scale-invariant
+by construction.
+
+- Rolling window: 6 hours, 24 hours, or "last N events" — tradeoff
+  between responsiveness and statistical stability
+- Cost: ~1 extra O(log N) operation per tick per channel (sorted
+  deque); negligible
+- Risk: information loss — percentile rank discards magnitude
+
+**B. Ratios of co-moving channels.** Replace single channels with
+ratios that should be more stable. Examples:
+- `hidden_trade_rate / (hidden_trade_rate + visible_trade_rate)` →
+  *fraction* of trades that are hidden, robust to overall trading
+  intensity drift
+- `lifespan_bid_p50 / lifespan_ask_p50` → bid/ask lifespan asymmetry,
+  robust to overall lifespan regime shift
+- `lifespan_p50 / event_interval_ms` → lifespan in "event-time
+  units" rather than wall-time
+
+**C. Z-score within rolling window.** Compute the channel's mean and
+std over recent N ticks, output `(x - rolling_mean) / rolling_std`.
+Continuous-valued (preserves magnitude info), but assumes near-Gaussian
+within the window.
+
+### 11.3 Recommended feature stack v2 design
+
+For each of the 19 v1 channels, decide whether it stays raw, becomes
+percentile-rank, becomes ratio, or gets dropped:
+
+| v1 channel | v2 disposition | Rationale |
+|---|---|---|
+| event_density_per_s | **Drop or keep raw** | Already scale-relative (per-second normalization); but absolute event rate drifts. Keep raw initially. |
+| arrival_rate_bid/ask_per_s | **Ratio: bid/(bid+ask)** | Imbalance is what matters, not absolute |
+| cancel_rate_bid/ask_per_s | **Ratio: bid/(bid+ask)** | Same logic |
+| aggressor_imbalance | **Keep raw** | Already a ratio ∈ [-1, 1], inherently scale-invariant |
+| spread_bps | **Keep raw** | Already in bps; scale-invariant by definition |
+| top_bid_size, top_ask_size | **Percentile rank within 6h window** | Sizes drift with market regime |
+| depth_imbalance_top5 | **Keep raw** | Already a ratio ∈ [-1, 1] |
+| hidden_trade_rate | **Percentile rank within 6h window** | The biggest drifter — needs hardest treatment |
+| queue_depletion_bid/ask_per_s | **Percentile rank or ratio: bid/(bid+ask)** | Rate-based, drift-prone |
+| lifespan_bid_p50_ms | **Percentile rank within 6h window** | Top-2 drifter — needs hardest treatment |
+| lifespan_ask_p50_ms | **Percentile rank within 6h window** | Top-1 drifter — needs hardest treatment |
+| lifespan_bid_p95_ms | **DROP** | Already flagged as net-noise in ablation; drifts and adds variance |
+| lifespan_ask_p95_ms | **DROP** | Same |
+| aggressor_autocorr_lag1 | **Keep raw** | Already an autocorrelation ∈ [-1, 1] |
+| aggressor_autocorr_lag5 | **Keep raw** | Same |
+
+Expected v2 input width: ~14-15 channels (down from 19), most either
+inherently bounded or percentile-rank-transformed.
+
+### 11.4 New L1 sensor work
+
+Implementation tasks for the sensor layer:
+
+1. **`RollingPercentileRanker`** class — maintains a rolling
+   `sortedcontainers.SortedList` (or numpy heap) of recent values
+   per channel; emits percentile rank per tick. Window configurable.
+   Add to `layer1_l3_sensors.py`.
+
+2. **Adapt `L3SensorArray.snapshot()`** to apply the per-channel
+   transform table from §11.3. Outputs the v2 FEATURE_COLS list
+   (different from v1).
+
+3. **Update `FEATURE_COLS`** in `layer1_l3_sensors.py` to the v2 set.
+   Update unit tests to verify ranges (most outputs should be in
+   well-defined bounded intervals).
+
+4. **Backward-compat path**: keep v1 outputs available behind a
+   `feature_stack_version="v1"` flag so we can rebuild old CSVs if
+   needed for cross-comparison.
+
+### 11.5 Validation protocol
+
+The key methodological change for v2 — **train+validate must include
+multi-window evidence from day one**, not single-window with optimistic
+"will it generalize" framing. Specifically:
+
+1. **Train v2 model** on w1 (2026-05-12 → 23) — exactly the same
+   training protocol as Phase 2, just with the v2 feature stack
+2. **Mandatory in-sample sanity check**: same per-day fire-rate +
+   threshold sweep diagnostics that revealed Phase 2's single-fire-day
+   concentration. Run on w1 train + w1 val.
+3. **Mandatory out-of-sample forward-test**: full w2 forward-test
+   with per-day breakdown. The SAME analysis suite that revealed
+   Phase 2's failure mechanism — `analysis_sol_w2_forward_test.py`
+   and `analysis_sol_w2_feature_drift.py`.
+4. **Pass criteria** (must clear all four):
+   - In-sample: fires on ≥ 4 of w1 train days AND ≥ 1 of w1 val days
+     with positive per-fire-day mean
+   - Out-of-sample: ≥ 60% of w2 fire-days have positive mean bps
+   - Bootstrap CI on pooled w2 fire-day trades > 0
+   - Feature drift KS-D < 0.05 on all retained channels (the v2
+     features should be drift-robust BY CONSTRUCTION; this is the
+     check that the engineering worked)
+
+### 11.6 Experiments to run, in order
+
+1. **(1 day) Implement v2 sensor stack** — `RollingPercentileRanker`
+   + transforms per §11.3. Unit tests for each new transform.
+   Re-aggregate w1 raw events with v2 sensors → `l3_ticks_v2_{symbol}.csv`.
+   Verify v2 KS-D between w1 train and w1 val on the recoded channels.
+2. **(0.5 day) Re-aggregate w2** with v2 sensors. Verify KS-D between
+   w1 and w2 on the v2 stack drops below 0.05 on the previously-drifted
+   channels. If it doesn't, the feature engineering didn't work and
+   we need to iterate before training.
+3. **(0.5 day) Train per-symbol SOL models** on v2 w1 train slice
+   at H ∈ {300, 1000} (the two that were least bad on v1). Sanity
+   check in-sample fire pattern matches v1's rare-firer profile.
+4. **(0.5 day) Forward-test v2 models on v2 w2**. Same analysis
+   suite as before. Compare to v1 baseline (−18 to −30 bps mean).
+5. **Decision gate**: did pooled w2 bps cross zero? If yes, signal
+   exists in v2 — proceed to Layer 3 work (with the new feature
+   stack). If no, deeper structural issue — consider symbol pivot
+   or label-design changes.
+
+### 11.7 What this DOESN'T attempt
+
+- **Rolling normalization on raw features.** Considered but rejected
+  by user preference for the more fundamental fix. Could be added
+  later if v2 also fails on structural drift (e.g., the rolling
+  window itself becomes the lever).
+- **Pivoting symbols.** Stay on BTC/ETH/SOL initially. If v2 also
+  fails on these three across w1+w2, then symbol pivot becomes
+  the next experiment.
+- **Adding regime-conditioning features** (recent vol, time-of-day,
+  basis-to-HL). Useful future direction but adds complexity; first
+  test whether drift-robust features alone are enough.
+- **New label horizons.** v1 work already explored H=300/500/1000;
+  no additional horizon experiments planned until v2 features clear
+  the drift gate.
+
+### 11.8 Honest expectation
+
+Going in: I expect v2 to **improve** the w2 forward-test result
+significantly (from −18-30 bps toward 0 or slightly positive) because
+the drift mechanism is well-identified and the percentile-rank fix
+is the textbook drift-robust transformation. But I would not predict
+high confidence that v2 will be clearly profitable — there may be
+additional structural issues (e.g., label horizon, the value of the
+signal itself) that fixing drift alone won't solve.
+
+If v2 lands in the −5 to +5 bps range on w2, that's progress worth
+continuing into regime-conditioning + Layer 3 design. If v2 also
+lands in the −20 bps range, the failure isn't just drift — it's
+something deeper about the signal hypothesis, and a more aggressive
+reset (different label, different instrument family) is warranted.
+
+The point of Phase 3 isn't to ship; it's to localize where the L3
+research hypothesis is right vs wrong with higher resolution than
+Phase 2 provided.

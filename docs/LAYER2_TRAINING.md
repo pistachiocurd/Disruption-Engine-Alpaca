@@ -997,6 +997,99 @@ the gating experiment**, not "additional confirmation."
 - [NEXT_PHASE_PLAN.md](../research/path_h_l3/NEXT_PHASE_PLAN.md) — refined success criteria, three w2 scenarios, Layer 3/4 progression, deployment plan
 - [HANDOFF.md](../research/path_h_l3/HANDOFF.md) §"Post-Phase-2 follow-up analysis" — same content as this subsection in operational form
 
+### 15.8 Window-2 forward-test — Scenario A confirmed; drift mechanism identified (2026-06-01)
+
+§15.6's "thesis confirmed" framing was already walked back in §15.7
+to "calibrated rare-firer candidate with single-fire-day evidence."
+This subsection is the resolution: window-2 data forward-tested the
+candidate and **falsified** it.
+
+**W2 harvest.** 2026-05-24 → 2026-06-01 (~8.4 calendar days, 50.7M
+events total across the 3 symbols). Aggregated to per-symbol tick CSVs
+using the same Phase 2 sensor stack and `--tick-events 100` setting.
+
+**Forward-test on existing Phase 2 per-symbol weights** at standard
+retail fees (10 bps maker / 20 bps taker = 30 bps RT), no retraining:
+
+| Symbol | H | N | Win% | Mean bps | Fire days | Positive fire-days | 95% CI |
+|---|---:|---:|---:|---:|---|---|---|
+| SOL | 300 | 3,137 | 5.4% | **−30.04** | 8/9 | **0/8** | [−30.82, −29.16] |
+| SOL | 500 | 4,590 | 15.1% | **−27.79** | 9/9 | **0/9** | [−28.83, −26.63] |
+| SOL | 1000 | 1,379 | 20.7% | **−18.45** | 8/9 | 1/8 | [−20.21, −16.61] |
+| BTC | 1000 | 1,089 | 3.5% | **−42.52** | 7/9 | 1/7 | [−43.84, −41.05] |
+
+Every configuration: pooled 95% CI well below zero, ≤ 1 of 7-9 fire-days
+positive. Per NEXT_PHASE_PLAN.md §3 this is **Scenario A — regime
+overfit**, the prior-probability ~25% case. The window-1 result was
+specific to the 2026-05-23 regime; nothing transfers.
+
+Notable patterns:
+- **SOL improves monotonically with H** (−30 at H=300 → −18 at H=1000)
+  but every horizon's CI stays well below zero. Horizon is not the lever.
+- **SOL H=1000 went all-long on w2** (1377L/2S at thr=0.95). On window 1
+  the same config was 216 long-biased; on window 2 it lost short-side
+  capacity entirely.
+- **BTC H=1000 fails worse than SOL.** Mean −42.52 bps is *larger* than
+  the 30 bps round-trip cost, meaning BTC's model has *negative*
+  directional accuracy on w2 (worse than random chance).
+
+**Failure mechanism — feature distribution drift.** The drift diagnostic
+(`analysis/analysis_sol_w2_feature_drift.py`) computed two-sample KS-D
+between w1 and w2 SOL features per channel. Result: the three most
+load-bearing channels (from the prior §15.7 ablation) are the three
+biggest drifters:
+
+| Channel | KS-D | Mean shift in training-σ | Std ratio w2/w1 | Prior ablation load |
+|---|---:|---:|---:|---:|
+| `hidden_trade_rate` | **0.239** | −0.52σ | 0.62 (38% compression) | +29.19 bps (load-bearing #3) |
+| `lifespan_bid_p50_ms` | **0.137** | +0.37σ | 1.16 | +34.49 bps (load-bearing #2) |
+| `lifespan_ask_p50_ms` | **0.125** | +0.41σ | 1.29 | +49.96 bps (load-bearing #1) |
+
+The model's prediction-output distribution shifted upward (median
+0.524 → 0.564, p95 0.786 → 0.834). Long-fire rate at thr=0.95 went
+0.45% → 1.34% (**3×**); short-fire rate barely moved. The model became
+systematically over-confident on the long side because drifted features
+push the sigmoid output rightward.
+
+Why this is unsurprising in retrospect: microstructure features like
+`hidden_trade_rate` and `lifespan_p50` measure *who participates in
+the market and how they behave*. Participant mix is week-to-week
+non-stationary. A model trained with static normalization stats from
+w1 cannot generalize across this kind of distribution shift.
+
+**What is and isn't falsified:**
+
+- ✗ The Phase 2 SOL model (specific weights, specific normalization,
+  specific raw-19-channel input). Dead.
+- ✗ The "train on a single capture window, normalize statically, deploy
+  with fixed weights" deployment shape. Will fail on any horizon where
+  microstructure regime shifts.
+- ✓ The L3 microstructure thesis itself — events at the order-by-order
+  level carry signal L2 destroys — remains plausible. The sensor stack,
+  harvester, aggregator, and unit tests are all sound. What failed is
+  the *modeling layer* (raw values fed to a TCN with static normalization).
+- ✓ The 7-sensor design captures the right phenomena. The fix is at
+  the feature-engineering layer, not the sensor layer.
+
+**Phase 3 — drift-robust feature engineering.** The next research
+direction (planned in [NEXT_PHASE_PLAN.md §11](../research/path_h_l3/NEXT_PHASE_PLAN.md))
+replaces raw drifted channels with scale-invariant alternatives:
+percentile ranks within rolling windows, ratios of co-moving channels,
+explicit regime indicators. The chosen fix is *feature engineering*,
+not rolling normalization — the former addresses the root cause
+(scale-variance), the latter only patches the symptom (distribution
+shift).
+
+L3 PPO / Layer 4 / live-deployment work remain **paused** until a
+generalizable signal exists in v2.
+
+**Artifacts.**
+- [analysis/analysis_sol_w2_forward_test.py](../research/path_h_l3/analysis/analysis_sol_w2_forward_test.py) — generalized forward-test (symbol + horizon CLI args)
+- [analysis/analysis_sol_w2_feature_drift.py](../research/path_h_l3/analysis/analysis_sol_w2_feature_drift.py) — KS-D + per-channel drift diagnostic
+- `calibration/forward_test_w2_{sol,btc}_H{300,500,1000}_summary.json` — per-config results
+- `calibration/feature_drift_w1_vs_w2_sol.json` — drift diagnostic output
+- Per-trade CSVs at thr=0.95 for each config
+
 ## 14. Pivot to directional bias prediction — L2 features carry real alpha (2026-05-12)
 
 ### 14.1 Temporal integrity check — §13.4 baseline was modestly inflated

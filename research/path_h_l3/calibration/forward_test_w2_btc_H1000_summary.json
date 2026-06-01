@@ -1,0 +1,463 @@
+{
+  "config": "tBTCUSD H=1000 seq_len=200 fees=10/20bps q=1.0",
+  "window": "w2 (2026-05-24 -> 2026-06-01 capture, forward-test using window-1 weights)",
+  "n_ticks": 186539,
+  "n_days": 9,
+  "days": [
+    "2026-05-24",
+    "2026-05-25",
+    "2026-05-26",
+    "2026-05-27",
+    "2026-05-28",
+    "2026-05-29",
+    "2026-05-30",
+    "2026-05-31",
+    "2026-06-01"
+  ],
+  "by_threshold": [
+    {
+      "thr": 0.9,
+      "n_total": 2954,
+      "long": 2174,
+      "short": 780,
+      "win_pct": 5.382532159783344,
+      "mean_bps": -38.162105885847915,
+      "fire_days": 7,
+      "total_days": 9,
+      "per_fire_day_mean_bps": -29.437913648623176,
+      "per_fire_day_std_bps": 22.224507876639855,
+      "per_fire_day_var_ratio": 0.7549620581783079,
+      "per_fire_day_positive_count": 1,
+      "bootstrap_ci_95": [
+        -38.903984751605385,
+        -37.38848905603378
+      ],
+      "ci_crosses_zero": false,
+      "per_day": [
+        {
+          "date": "2026-05-24",
+          "ticks": 15457,
+          "trades": 514,
+          "long": 504,
+          "short": 10,
+          "win_pct": 0.0,
+          "mean_bps": -47.85394139018825,
+          "fired": true
+        },
+        {
+          "date": "2026-05-25",
+          "ticks": 18481,
+          "trades": 1458,
+          "long": 1373,
+          "short": 85,
+          "win_pct": 1.0973936899862824,
+          "mean_bps": -40.22996392749647,
+          "fired": true
+        },
+        {
+          "date": "2026-05-26",
+          "ticks": 27569,
+          "trades": 106,
+          "long": 106,
+          "short": 0,
+          "win_pct": 12.264150943396226,
+          "mean_bps": -7.990203240516577,
+          "fired": true
+        },
+        {
+          "date": "2026-05-27",
+          "ticks": 25804,
+          "trades": 0,
+          "long": 0,
+          "short": 0,
+          "win_pct": 0.0,
+          "mean_bps": 0.0,
+          "fired": false
+        },
+        {
+          "date": "2026-05-28",
+          "ticks": 29264,
+          "trades": 461,
+          "long": 100,
+          "short": 361,
+          "win_pct": 20.607375271149674,
+          "mean_bps": -26.52945806297505,
+          "fired": true
+        },
+        {
+          "date": "2026-05-29",
+          "ticks": 25733,
+          "trades": 0,
+          "long": 0,
+          "short": 0,
+          "win_pct": 0.0,
+          "mean_bps": 0.0,
+          "fired": false
+        },
+        {
+          "date": "2026-05-30",
+          "ticks": 11256,
+          "trades": 187,
+          "long": 4,
+          "short": 183,
+          "win_pct": 0.0,
+          "mean_bps": -60.462016960049134,
+          "fired": true
+        },
+        {
+          "date": "2026-05-31",
+          "ticks": 13431,
+          "trades": 198,
+          "long": 82,
+          "short": 116,
+          "win_pct": 5.05050505050505,
+          "mean_bps": -26.221513482848653,
+          "fired": true
+        },
+        {
+          "date": "2026-06-01",
+          "ticks": 19544,
+          "trades": 30,
+          "long": 5,
+          "short": 25,
+          "win_pct": 83.33333333333334,
+          "mean_bps": 3.221701523711914,
+          "fired": true
+        }
+      ]
+    },
+    {
+      "thr": 0.95,
+      "n_total": 1089,
+      "long": 722,
+      "short": 367,
+      "win_pct": 3.489439853076217,
+      "mean_bps": -42.522951764114445,
+      "fire_days": 7,
+      "total_days": 9,
+      "per_fire_day_mean_bps": -32.87341394980652,
+      "per_fire_day_std_bps": 28.625331778918028,
+      "per_fire_day_var_ratio": 0.8707745360011964,
+      "per_fire_day_positive_count": 1,
+      "bootstrap_ci_95": [
+        -43.838799642060955,
+        -41.04623210773177
+      ],
+      "ci_crosses_zero": false,
+      "per_day": [
+        {
+          "date": "2026-05-24",
+          "ticks": 15457,
+          "trades": 121,
+          "long": 120,
+          "short": 1,
+          "win_pct": 0.0,
+          "mean_bps": -40.33531001587042,
+          "fired": true
+        },
+        {
+          "date": "2026-05-25",
+          "ticks": 18481,
+          "trades": 403,
+          "long": 379,
+          "short": 24,
+          "win_pct": 0.7444168734491315,
+          "mean_bps": -53.02825865537494,
+          "fired": true
+        },
+        {
+          "date": "2026-05-26",
+          "ticks": 27569,
+          "trades": 82,
+          "long": 82,
+          "short": 0,
+          "win_pct": 9.75609756097561,
+          "mean_bps": -6.50730589703387,
+          "fired": true
+        },
+        {
+          "date": "2026-05-27",
+          "ticks": 25804,
+          "trades": 0,
+          "long": 0,
+          "short": 0,
+          "win_pct": 0.0,
+          "mean_bps": 0.0,
+          "fired": false
+        },
+        {
+          "date": "2026-05-28",
+          "ticks": 29264,
+          "trades": 264,
+          "long": 71,
+          "short": 193,
+          "win_pct": 7.575757575757576,
+          "mean_bps": -36.878299569842724,
+          "fired": true
+        },
+        {
+          "date": "2026-05-29",
+          "ticks": 25733,
+          "trades": 0,
+          "long": 0,
+          "short": 0,
+          "win_pct": 0.0,
+          "mean_bps": 0.0,
+          "fired": false
+        },
+        {
+          "date": "2026-05-30",
+          "ticks": 11256,
+          "trades": 87,
+          "long": 0,
+          "short": 87,
+          "win_pct": 0.0,
+          "mean_bps": -76.98206438310069,
+          "fired": true
+        },
+        {
+          "date": "2026-05-31",
+          "ticks": 13431,
+          "trades": 125,
+          "long": 70,
+          "short": 55,
+          "win_pct": 0.0,
+          "mean_bps": -25.211401151417235,
+          "fired": true
+        },
+        {
+          "date": "2026-06-01",
+          "ticks": 19544,
+          "trades": 7,
+          "long": 0,
+          "short": 7,
+          "win_pct": 100.0,
+          "mean_bps": 8.82874202399425,
+          "fired": true
+        }
+      ]
+    },
+    {
+      "thr": 0.97,
+      "n_total": 545,
+      "long": 293,
+      "short": 252,
+      "win_pct": 1.4678899082568808,
+      "mean_bps": -39.0776979306978,
+      "fire_days": 6,
+      "total_days": 9,
+      "per_fire_day_mean_bps": -39.029275953771545,
+      "per_fire_day_std_bps": 23.85096894218511,
+      "per_fire_day_var_ratio": 0.6111045711028698,
+      "per_fire_day_positive_count": 0,
+      "bootstrap_ci_95": [
+        -41.04482144016859,
+        -37.23164158076018
+      ],
+      "ci_crosses_zero": false,
+      "per_day": [
+        {
+          "date": "2026-05-24",
+          "ticks": 15457,
+          "trades": 98,
+          "long": 98,
+          "short": 0,
+          "win_pct": 0.0,
+          "mean_bps": -39.30955518053305,
+          "fired": true
+        },
+        {
+          "date": "2026-05-25",
+          "ticks": 18481,
+          "trades": 11,
+          "long": 6,
+          "short": 5,
+          "win_pct": 0.0,
+          "mean_bps": -44.58440895341512,
+          "fired": true
+        },
+        {
+          "date": "2026-05-26",
+          "ticks": 27569,
+          "trades": 65,
+          "long": 65,
+          "short": 0,
+          "win_pct": 10.76923076923077,
+          "mean_bps": -5.071997795741682,
+          "fired": true
+        },
+        {
+          "date": "2026-05-27",
+          "ticks": 25804,
+          "trades": 0,
+          "long": 0,
+          "short": 0,
+          "win_pct": 0.0,
+          "mean_bps": 0.0,
+          "fired": false
+        },
+        {
+          "date": "2026-05-28",
+          "ticks": 29264,
+          "trades": 187,
+          "long": 58,
+          "short": 129,
+          "win_pct": 0.53475935828877,
+          "mean_bps": -43.143054748016056,
+          "fired": true
+        },
+        {
+          "date": "2026-05-29",
+          "ticks": 25733,
+          "trades": 0,
+          "long": 0,
+          "short": 0,
+          "win_pct": 0.0,
+          "mean_bps": 0.0,
+          "fired": false
+        },
+        {
+          "date": "2026-05-30",
+          "ticks": 11256,
+          "trades": 76,
+          "long": 0,
+          "short": 76,
+          "win_pct": 0.0,
+          "mean_bps": -77.06398891885735,
+          "fired": true
+        },
+        {
+          "date": "2026-05-31",
+          "ticks": 13431,
+          "trades": 108,
+          "long": 66,
+          "short": 42,
+          "win_pct": 0.0,
+          "mean_bps": -25.002650126066005,
+          "fired": true
+        },
+        {
+          "date": "2026-06-01",
+          "ticks": 19544,
+          "trades": 0,
+          "long": 0,
+          "short": 0,
+          "win_pct": 0.0,
+          "mean_bps": 0.0,
+          "fired": false
+        }
+      ]
+    },
+    {
+      "thr": 0.98,
+      "n_total": 457,
+      "long": 246,
+      "short": 211,
+      "win_pct": 1.0940919037199124,
+      "mean_bps": -38.910844046150594,
+      "fire_days": 6,
+      "total_days": 9,
+      "per_fire_day_mean_bps": -34.50234765671327,
+      "per_fire_day_std_bps": 25.307243628244347,
+      "per_fire_day_var_ratio": 0.7334933807995587,
+      "per_fire_day_positive_count": 0,
+      "bootstrap_ci_95": [
+        -40.9235899220724,
+        -36.995040839538504
+      ],
+      "ci_crosses_zero": false,
+      "per_day": [
+        {
+          "date": "2026-05-24",
+          "ticks": 15457,
+          "trades": 84,
+          "long": 84,
+          "short": 0,
+          "win_pct": 0.0,
+          "mean_bps": -38.81490182592137,
+          "fired": true
+        },
+        {
+          "date": "2026-05-25",
+          "ticks": 18481,
+          "trades": 2,
+          "long": 0,
+          "short": 2,
+          "win_pct": 0.0,
+          "mean_bps": -16.8033705971066,
+          "fired": true
+        },
+        {
+          "date": "2026-05-26",
+          "ticks": 27569,
+          "trades": 55,
+          "long": 55,
+          "short": 0,
+          "win_pct": 9.090909090909092,
+          "mean_bps": -5.033145365413063,
+          "fired": true
+        },
+        {
+          "date": "2026-05-27",
+          "ticks": 25804,
+          "trades": 0,
+          "long": 0,
+          "short": 0,
+          "win_pct": 0.0,
+          "mean_bps": 0.0,
+          "fired": false
+        },
+        {
+          "date": "2026-05-28",
+          "ticks": 29264,
+          "trades": 155,
+          "long": 46,
+          "short": 109,
+          "win_pct": 0.0,
+          "mean_bps": -44.14656189655443,
+          "fired": true
+        },
+        {
+          "date": "2026-05-29",
+          "ticks": 25733,
+          "trades": 0,
+          "long": 0,
+          "short": 0,
+          "win_pct": 0.0,
+          "mean_bps": 0.0,
+          "fired": false
+        },
+        {
+          "date": "2026-05-30",
+          "ticks": 11256,
+          "trades": 64,
+          "long": 0,
+          "short": 64,
+          "win_pct": 0.0,
+          "mean_bps": -77.1607624638487,
+          "fired": true
+        },
+        {
+          "date": "2026-05-31",
+          "ticks": 13431,
+          "trades": 97,
+          "long": 61,
+          "short": 36,
+          "win_pct": 0.0,
+          "mean_bps": -25.055343791435465,
+          "fired": true
+        },
+        {
+          "date": "2026-06-01",
+          "ticks": 19544,
+          "trades": 0,
+          "long": 0,
+          "short": 0,
+          "win_pct": 0.0,
+          "mean_bps": 0.0,
+          "fired": false
+        }
+      ]
+    }
+  ]
+}

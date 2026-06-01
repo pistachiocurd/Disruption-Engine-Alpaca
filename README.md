@@ -1,19 +1,31 @@
 # Disruption Arbitrage Engine
 
-> **Status (2026-05-24)**: Private research prototype.
+> **Status (2026-06-01)**: Private research prototype.
 >
-> **L3 microstructure investigation in progress.** Phase 2 sensor stack +
-> per-symbol TCN training (see [docs/LAYER2_TRAINING.md §15](docs/LAYER2_TRAINING.md))
-> produced a **calibrated rare-firer candidate** on SOL: +11.97 bps/trade
-> at thr=0.95 over 423 trades — but all 423 trades fired on a single
-> calendar day. Threshold sweep + train-set fire-rate diagnostic confirm
-> the model is structurally a rare-firer (fires on 9/10 training days)
-> with correctly tuned threshold (forcing non-fire days to fire produces
-> losses). Window-2 harvest is in progress; multi-fire-day generalization
-> is the gating experiment before any Layer 3 (execution policy) or
-> live-deployment work. See
-> [research/path_h_l3/HANDOFF.md](research/path_h_l3/HANDOFF.md) and
-> [research/path_h_l3/NEXT_PHASE_PLAN.md](research/path_h_l3/NEXT_PHASE_PLAN.md).
+> **L3 microstructure Phase 2 falsified on window-2 forward-test.**
+> The Phase 2 per-symbol TCN models (see
+> [docs/LAYER2_TRAINING.md §15](docs/LAYER2_TRAINING.md))
+> produced a candidate result on window 1 (SOL +11.97 bps/trade at
+> thr=0.95) that turned out to be single-fire-day evidence. Window-2
+> forward-test on a fresh 8.4-day capture (2026-05-24 → 2026-06-01)
+> showed all four tested configs (SOL H=300/500/1000, BTC H=1000)
+> land at −18 to −43 bps/trade with 95% CIs well below zero. **The
+> failure mechanism is identified**: feature-distribution drift on
+> the top load-bearing channels (KS-D 0.12-0.24 on `hidden_trade_rate`
+> and `lifespan_p50` bid/ask, which are also the top-3 most
+> load-bearing per the prior ablation). See
+> [docs/LAYER2_TRAINING.md §15.8](docs/LAYER2_TRAINING.md).
+>
+> **Phase 3 — drift-robust feature engineering** is the next research
+> direction: replace raw drift-prone channels with percentile ranks
+> within rolling windows, ratios of co-moving channels, and explicit
+> regime indicators. Plan in
+> [research/path_h_l3/NEXT_PHASE_PLAN.md §11](research/path_h_l3/NEXT_PHASE_PLAN.md).
+> L3 execution-policy work and live deployment remain **paused**
+> until a generalizable signal exists.
+>
+> Operational state: see
+> [research/path_h_l3/HANDOFF.md](research/path_h_l3/HANDOFF.md).
 >
 > **L2 investigation closed** (§14.7-§14.8). Path D features (CE ratio,
 > OBI, MLOFI, VAMP, Kyle's λ) carry real directional signal (~55% paper

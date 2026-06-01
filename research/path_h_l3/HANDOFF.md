@@ -91,14 +91,84 @@ independent fire-days to estimate the per-fire-day distribution.
 **Window-2 harvest is the gating experiment**, not "additional
 confirmation." See [NEXT_PHASE_PLAN.md](NEXT_PHASE_PLAN.md).
 
-See LAYER2_TRAINING.md §15 (and new §15.7) for the full chapter.
-Phase 2 narrative + follow-up analysis + Layer 3/4 progression are
-in [NEXT_PHASE_PLAN.md](NEXT_PHASE_PLAN.md).
+### Window-2 forward-test outcome (2026-06-01) — Scenario A confirmed
 
-**Status: Phase 2 produced a calibrated rare-firer candidate with
-single-fire-day evidence; per-fire-day generalization is unverified
-and w2 is the gating experiment before any L3 (execution policy) work
-or live deployment.**
+Window 2 harvested 2026-05-24 → 2026-06-01 (8.43 days, 143k SOL ticks
++ 187k BTC ticks + 178k ETH ticks). Forward-tested the existing
+per-symbol weights at standard retail fees on **all of w2 as out-of-sample**:
+
+| Symbol | H | N | Win% | Mean bps | Fire days | Positive fire-days | CI 95% |
+|---|---:|---:|---:|---:|---|---|---|
+| SOL | 300 | 3,137 | 5.4% | **−30.04** | 8/9 | **0/8** | [−30.82, −29.16] |
+| SOL | 500 | 4,590 | 15.1% | **−27.79** | 9/9 | **0/9** | [−28.83, −26.63] |
+| SOL | 1000 | 1,379 | 20.7% | **−18.45** | 8/9 | 1/8 | [−20.21, −16.61] |
+| BTC | 1000 | 1,089 | 3.5% | **−42.52** | 7/9 | 1/7 | [−43.84, −41.05] |
+
+Every config: CI well below zero, ≤ 1 of 7-9 fire-days positive.
+Per [NEXT_PHASE_PLAN §3 Scenario A](NEXT_PHASE_PLAN.md): regime overfit
+confirmed. The Phase 2 result was a single-fire-day artifact specific
+to the 2026-05-23 regime.
+
+### Feature drift diagnostic — the failure mechanism
+
+[analysis/analysis_sol_w2_feature_drift.py](analysis/analysis_sol_w2_feature_drift.py)
+computed KS-D between w1 and w2 per channel. The three most load-bearing
+channels (from the prior ablation) are the three biggest drifters:
+
+| Channel | KS-D | Mean shift in training-σ | Std ratio w2/w1 | Ablation load (bps) |
+|---|---:|---:|---:|---:|
+| hidden_trade_rate | **0.239** | −0.52σ | 0.62 | +29.19 |
+| lifespan_bid_p50_ms | **0.137** | +0.37σ | 1.16 | +34.49 |
+| lifespan_ask_p50_ms | **0.125** | +0.41σ | 1.29 | +49.96 |
+
+The model's prediction-output distribution shifted upward (median
+0.524 → 0.564, p95 0.786 → 0.834). Long-fire rate at thr=0.95 went
+0.45% → 1.34% (**3×**); short-fire rate barely moved. The model
+became systematically over-confident on the long side because drifted
+features push the sigmoid output rightward.
+
+Mechanism: microstructure features like `hidden_trade_rate` and
+`lifespan_p50` measure *who participates in the market and how they
+behave*. Participant mix is week-to-week non-stationary. A model
+trained with static normalization stats from w1 cannot generalize
+across this kind of distribution shift.
+
+**Horizon doesn't fix this.** SOL improves monotonically with H (−30
+at H=300 → −18 at H=1000) but every horizon's CI is well below zero.
+H affects what's predicted, not what's seen — the drift is on inputs.
+
+### Status — L3 thesis falsified, feature engineering reset planned
+
+**Phase 2 thesis falsified by w2 forward-test.** Current weights +
+current static normalization + current 19-channel raw feature stack
+do not generalize across capture windows. The "rare-firer-but-real"
+candidate framing from §15.7 was wrong; it was rare-firer-but-overfit.
+
+**L3 microstructure thesis as a research direction is NOT falsified.**
+The sensors compute what they should; the harvester+aggregator pipeline
+is sound; the channels themselves likely carry information. But the
+deployment shape implied by Phase 2 ("train once, normalize once,
+deploy with fixed weights") is wrong for non-stationary microstructure
+features.
+
+**Next research phase: Phase 3 — drift-robust feature engineering.**
+Replace raw drifted channels (`hidden_trade_rate`, `lifespan_p50` bid
+and ask) with scale-invariant alternatives (percentile ranks within
+rolling windows, ratios of co-moving channels). Add explicit regime
+features. Retest the train→forward-test pipeline with the new feature
+stack.
+
+L3 PPO / L4 / live-deployment work remains **paused** until a
+generalizable signal exists.
+
+See LAYER2_TRAINING.md §15 (chapter), §15.7 (Phase 2 follow-up
+analysis), §15.8 (w2 forward-test + drift diagnostic). Phase 3
+feature-engineering plan in [NEXT_PHASE_PLAN.md](NEXT_PHASE_PLAN.md) §11.
+
+**Status: Phase 2 thesis falsified on w2 forward-test. Failure
+mechanism identified as feature distribution drift on top load-bearing
+channels. Phase 3 (drift-robust feature engineering) is the next
+research direction. L3 execution policy / live deployment paused.**
 
 ## Status as of handoff
 
