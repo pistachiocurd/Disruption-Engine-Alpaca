@@ -6,7 +6,7 @@ This project investigates whether high-frequency market microstructure features 
 ## Motivation
 Financial models often degrade when market conditions shift. This project studies feature drift, hidden liquidity behavior, order imbalance, and order lifespan metrics to evaluate signal robustness.
 
-## What I Built
+## My Contribution
 - Engineered L3-style market microstructure features including order imbalance, hidden trade rate, order lifespan, and liquidity behavior.
 - Compared feature behavior across different time windows to identify distribution drift.
 - Built calibration scripts to analyze feature stability and model degradation.
@@ -17,4 +17,4 @@ Financial models often degrade when market conditions shift. This project studie
 Python, pandas, NumPy, statistical analysis, feature engineering, time-series analysis, market microstructure, drift analysis.
 
 ## Why It Matters
-In financial ML, predictive performance often breaks because the market regime changes. This project focuses on diagnosing why a signal works in one window but weakens in another.
+In financial ML, predictive performance often breaks because the market regime changes. This project focuses on diagnosing why a signal works in one window but weakens in another.git 
